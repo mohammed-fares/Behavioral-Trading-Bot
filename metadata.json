@@ -1,0 +1,6 @@
+{
+  "name": "Behavioral Bot — Multi-Timeframe Behavioral Trading Bot",
+  "description": "بوت التداول السلوكي متعدد الأطر الزمنية — يتعلم سلوك العملات عبر 7 أطر زمنية، ويبني ذاكرة دائمة للأنماط، ويتخذ قرارات تداول شفافة ومبنية على التوافق التاريخي.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
