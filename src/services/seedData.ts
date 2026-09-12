@@ -17,6 +17,7 @@ import {
 export const DEFAULT_SETTINGS: StrategySettings = {
   strategyMode: 'DAY_TRADING',
   tradingExecutionMode: 'PAPER',
+  marketType: 'USDT_M_FUTURES',
   apiKey: '',
   apiSecret: '',
   isApiConnected: false,
@@ -27,6 +28,7 @@ export const DEFAULT_SETTINGS: StrategySettings = {
   enabledTimeframes: ['1m', '5m', '15m', '30m', '1h', '4h', '1d'],
   minOccurrences: 20,
   minConfidence: 65,
+  minSimilarityPct: 75,
   minMovementPct: 0.5,
   maxPatternAgeDays: 90,
   minSupportingFrames: 4,
@@ -47,6 +49,9 @@ export const DEFAULT_SETTINGS: StrategySettings = {
   hourlyReportAutoExport: true,
   hourlyReportIntervalMinutes: 60,
   avoidPastFailedPatterns: true,
+  failedPatternCoolingHours: 24,
+  maxSpreadPct: 0.08,
+  maxDataAgeSeconds: 15,
 };
 
 export const DEFAULT_STATS: UserStats = {

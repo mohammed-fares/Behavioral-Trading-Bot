@@ -32,7 +32,9 @@ import {
   RotateCcw,
   Download,
   Database,
-  FileText
+  FileText,
+  Wifi,
+  WifiOff
 } from 'lucide-react';
 import { ResponsiveContainer, AreaChart, Area, XAxis, YAxis, Tooltip, CartesianGrid } from 'recharts';
 import { 
@@ -75,6 +77,9 @@ interface DashboardTabProps {
     lastSyncTime: number;
     estimatedKb: number;
   };
+  isConnectionLost?: boolean;
+  reconnectCount?: number;
+  onManualReconnect?: () => void;
 }
 
 export const DashboardTab: React.FC<DashboardTabProps> = ({
@@ -97,6 +102,9 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
   disqualifiedPatterns = [],
   onExportCurrentHourReport,
   dbStats,
+  isConnectionLost = false,
+  reconnectCount = 0,
+  onManualReconnect
 }) => {
   // Chart data: Realistic performance curve
   const performanceData = [
@@ -166,9 +174,28 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
                 }`}>
                   {isLive ? '🔴 تداول حقيقي (Live Binance)' : '🟢 تداول وهمي تجريبي (Paper)'}
                 </span>
+
+                {/* Connection Status Badge */}
+                {isConnectionLost ? (
+                  <button 
+                    onClick={onManualReconnect}
+                    className="px-2.5 py-0.5 rounded-full text-xs font-bold font-mono bg-rose-500/25 text-rose-300 border border-rose-500/50 flex items-center gap-1.5 animate-pulse hover:bg-rose-500/35 transition"
+                    title="انقطع الاتصال - تم إيقاف البوت لمنع البيانات الوهمية (اضغط لإعادة المحاولة فوراً)"
+                  >
+                    <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                    <span>منقطع (البوت متوقف)</span>
+                    {reconnectCount > 0 && <span className="text-[10px] bg-rose-900/60 px-1 rounded text-rose-200">#{reconnectCount}</span>}
+                  </button>
+                ) : (
+                  <span className="px-2.5 py-0.5 rounded-full text-[10px] font-mono bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 flex items-center gap-1">
+                    <Wifi className="w-3 h-3 text-emerald-400" />
+                    <span>بيانات Binance حية فقط (حظر الوهمي نشط)</span>
+                  </span>
+                )}
+
                 <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-slate-800 text-slate-300 border border-slate-700 flex items-center gap-1">
-                  <span className={`w-1.5 h-1.5 rounded-full ${isAutoScanning ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
-                  {isAutoScanning ? 'المحرك يعمل باستمرار 24/7' : 'المحرك متوقف مؤقتاً'}
+                  <span className={`w-1.5 h-1.5 rounded-full ${isAutoScanning && !isConnectionLost ? 'bg-emerald-400 animate-ping' : 'bg-amber-400'}`} />
+                  {isConnectionLost ? 'المحرك معلّق مؤقتاً بسبب انقطاع الاتصال' : isAutoScanning ? 'المحرك يعمل باستمرار 24/7' : 'المحرك متوقف مؤقتاً'}
                 </span>
               </div>
 

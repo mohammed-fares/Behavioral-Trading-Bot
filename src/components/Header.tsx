@@ -20,7 +20,12 @@ import {
   HelpCircle,
   Wallet,
   ShieldCheck,
-  Cpu
+  Cpu,
+  BarChart2,
+  Terminal,
+  Wifi,
+  WifiOff,
+  RefreshCw
 } from 'lucide-react';
 import { UserStats, StrategySettings } from '../types';
 
@@ -42,6 +47,9 @@ interface HeaderProps {
   totalPatterns: number;
   hourlyReportsCount?: number;
   disqualifiedCount?: number;
+  isConnectionLost?: boolean;
+  reconnectCount?: number;
+  onManualReconnect?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -62,6 +70,9 @@ export const Header: React.FC<HeaderProps> = ({
   totalPatterns,
   hourlyReportsCount = 0,
   disqualifiedCount = 0,
+  isConnectionLost = false,
+  reconnectCount = 0,
+  onManualReconnect
 }) => {
   const tabs = [
     { id: 'dashboard', label: 'لوحة القيادة', icon: Activity },
@@ -70,6 +81,8 @@ export const Header: React.FC<HeaderProps> = ({
     { id: 'decisions', label: 'سجل القرارات', icon: FileText },
     { id: 'trades', label: 'سجل الصفقات', icon: History },
     { id: 'analytics', label: 'الإحصائيات السلوكية', icon: BarChart3 },
+    { id: 'backtest', label: 'الاختبار الرجعي', icon: BarChart2 },
+    { id: 'audit', label: 'سجل التدقيق والصحة', icon: Terminal },
     { id: 'settings', label: 'الإعدادات والمخاطر', icon: Sliders },
   ];
 
@@ -132,6 +145,34 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </button>
 
+          {/* Network Connection Status Badge */}
+          <button
+            onClick={onManualReconnect}
+            title={isConnectionLost ? `انقطع الاتصال - محاولة إعادة الاتصال #${reconnectCount} (اضغط لإعادة المحاولة فوراً)` : 'الاتصال المباشر بخوادم بينانس نشط (بيانات حية فقط)'}
+            className={`hidden sm:flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border text-xs font-semibold transition ${
+              isConnectionLost
+                ? 'bg-rose-950/80 border-rose-500/80 text-rose-300 animate-pulse hover:bg-rose-900/80'
+                : 'bg-slate-950/60 border-slate-800 text-emerald-400 hover:border-emerald-500/50'
+            }`}
+          >
+            {isConnectionLost ? (
+              <>
+                <WifiOff className="w-3.5 h-3.5 text-rose-400" />
+                <span>منقطع (البوت متوقف)</span>
+                {reconnectCount > 0 && (
+                  <span className="text-[10px] font-mono bg-rose-900 px-1 rounded text-rose-200">
+                    #{reconnectCount}
+                  </span>
+                )}
+              </>
+            ) : (
+              <>
+                <Wifi className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="hidden md:inline">متصل بـ Binance</span>
+              </>
+            )}
+          </button>
+
           {/* Balance & PnL */}
           <div className="bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-1.5 hidden md:flex items-center gap-3">
             <div>
@@ -189,11 +230,15 @@ export const Header: React.FC<HeaderProps> = ({
             {/* Manual Scan */}
             <button
               onClick={onManualScan}
-              disabled={isScanningNow}
-              title="مسح دوري للعملات عبر الأطر السبعة الآن"
-              className="hidden lg:flex items-center gap-1.5 bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 text-xs font-medium px-2.5 sm:px-3 py-1.5 rounded-lg border border-slate-700 transition"
+              disabled={isScanningNow || isConnectionLost}
+              title={isConnectionLost ? "لا يمكن إجراء مسح في حال انقطاع الاتصال — البوت متوقف" : "مسح دوري للعملات عبر الأطر السبعة الآن"}
+              className={`hidden lg:flex items-center gap-1.5 text-xs font-medium px-2.5 sm:px-3 py-1.5 rounded-lg border transition ${
+                isConnectionLost
+                  ? 'bg-slate-900/50 border-slate-800 text-slate-500 cursor-not-allowed'
+                  : 'bg-slate-800 hover:bg-slate-700 active:bg-slate-600 text-slate-200 border-slate-700'
+              }`}
             >
-              <Cpu className={`w-3.5 h-3.5 text-emerald-400 ${isScanningNow ? 'animate-spin' : ''}`} />
+              <Cpu className={`w-3.5 h-3.5 ${isConnectionLost ? 'text-slate-500' : 'text-emerald-400'} ${isScanningNow ? 'animate-spin' : ''}`} />
               <span>مسح فوري</span>
             </button>
 

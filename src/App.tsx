@@ -31,6 +31,12 @@ import {
   AnalyticsTab 
 } from './components/AnalyticsTab';
 import { 
+  BacktestTab 
+} from './components/BacktestTab';
+import { 
+  SystemAuditTab 
+} from './components/SystemAuditTab';
+import { 
   SettingsTab 
 } from './components/SettingsTab';
 import { 
@@ -48,11 +54,23 @@ import {
 import {
   HourlyReportsModal
 } from './components/HourlyReportsModal';
+import { 
+  WifiOff, 
+  RotateCw, 
+  RefreshCw, 
+  AlertTriangle 
+} from 'lucide-react';
 
 import { StorageService } from './services/storage';
 import { BinanceService, TickerData } from './services/binance';
 import { BehaviorEngine } from './services/behaviorEngine';
 import { HourlyReporter } from './services/hourlyReporter';
+import { MarketDataLayer } from './services/marketData/marketDataLayer';
+import { RiskEngine } from './services/risk/riskEngine';
+import { FuturesRiskCalculator } from './services/risk/futuresRisk';
+import { OrderManager } from './services/execution/orderManager';
+import { AuditLogger } from './services/audit/auditLogger';
+import { RegimeDetector } from './services/learning/regime';
 import { 
   UserStats, 
   StrategySettings, 
@@ -89,6 +107,11 @@ export default function App() {
   const [isScanningNow, setIsScanningNow] = useState<boolean>(false);
   const [lastDbSync, setLastDbSync] = useState<number>(Date.now());
 
+  // Strict Connectivity & Fail-Closed State (No Synthetic Data in LIVE or PAPER)
+  const [isConnectionLost, setIsConnectionLost] = useState<boolean>(false);
+  const [reconnectCount, setReconnectCount] = useState<number>(0);
+  const [isReconnecting, setIsReconnecting] = useState<boolean>(false);
+
   // Modals & Feedback
   const [viewingDecision, setViewingDecision] = useState<DecisionLog | null>(null);
   const [isScenarioModalOpen, setIsScenarioModalOpen] = useState<boolean>(false);
@@ -101,6 +124,79 @@ export default function App() {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3500);
   };
+
+  // Handler: Manual Reconnection attempt
+  const handleManualReconnect = useCallback(async () => {
+    setIsReconnecting(true);
+    try {
+      const pingOk = await BinanceService.ping();
+      if (pingOk) {
+        const live = await BinanceService.getAllTickers();
+        if (live && Object.keys(live).length > 0) {
+          setTickers(live);
+          setIsConnectionLost(false);
+          setReconnectCount(0);
+          AuditLogger.info('SYSTEM', 'CONNECTION_RESTORED', 'تمت استعادة الاتصال بخوادم بينانس بنجاح واستئناف عمليات البوت بالبيانات الحقيقية.');
+          showToast('🟢 تمت استعادة الاتصال بنجاح واستئناف عمل البوت بالبيانات الحية!');
+          setIsReconnecting(false);
+          return true;
+        }
+      }
+    } catch {
+      // still failing
+    }
+    setReconnectCount(prev => prev + 1);
+    setIsReconnecting(false);
+    return false;
+  }, []);
+
+  // Monitor browser online/offline events
+  useEffect(() => {
+    const handleOffline = () => {
+      setIsConnectionLost(true);
+      AuditLogger.critical('SYSTEM', 'INTERNET_OFFLINE', 'تم استشعار انقطاع اتصال الإنترنت — تم إيقاف عمل البوت فورياً لحظر توليد أو استخدام أي أرقام وهمية.');
+      showToast('⚠️ انقطع اتصال الإنترنت! تم إيقاف عمل البوت ومحرك القرارات فورياً.');
+    };
+
+    const handleOnline = async () => {
+      AuditLogger.info('SYSTEM', 'INTERNET_ONLINE', 'عادت شبكة الإنترنت. جاري التحقق من خوادم بينانس واستئناف العمل...');
+      handleManualReconnect();
+    };
+
+    window.addEventListener('offline', handleOffline);
+    window.addEventListener('online', handleOnline);
+
+    return () => {
+      window.removeEventListener('offline', handleOffline);
+      window.removeEventListener('online', handleOnline);
+    };
+  }, [handleManualReconnect]);
+
+  // Automated Reconnect loop when connection is lost
+  useEffect(() => {
+    if (!isConnectionLost) return;
+
+    const retryInterval = setInterval(async () => {
+      setReconnectCount(prev => prev + 1);
+      try {
+        const pingOk = await BinanceService.ping();
+        if (pingOk) {
+          const live = await BinanceService.getAllTickers();
+          if (live && Object.keys(live).length > 0) {
+            setTickers(live);
+            setIsConnectionLost(false);
+            setReconnectCount(0);
+            AuditLogger.info('SYSTEM', 'CONNECTION_RESTORED', 'تمت إعادة الاتصال تلقائياً بنجاح واستئناف عمل البوت بالبيانات الحية.');
+            showToast('🟢 تمت استعادة الاتصال تلقائياً واستئناف عمل البوت بالبيانات الحية!');
+          }
+        }
+      } catch {
+        // still disconnected, retry next interval
+      }
+    }, 3500);
+
+    return () => clearInterval(retryInterval);
+  }, [isConnectionLost]);
 
   // Helper: Register negative lesson & disqualified pattern to prevent error repetition
   const registerNegativeLesson = useCallback((trade: Trade, lossUsd: number, reason: string) => {
@@ -236,27 +332,43 @@ export default function App() {
     showToast(`🚨 تم إغلاق كافة الصفقات النشطة (${closed.length}) وحجز النتيجة بنجاح!`);
   };
 
-  // 1. Live Market Prices Fetcher (Binance API with synthetic fallback)
+  // 1. Live Market Prices Fetcher (Binance API strictly without synthetic fallback)
   useEffect(() => {
     const fetchPrices = async () => {
       try {
         const live = await BinanceService.getAllTickers();
-        setTickers(live);
-      } catch (err) {
-        console.error('Error fetching market prices:', err);
+        if (live && Object.keys(live).length > 0) {
+          setTickers(live);
+          if (isConnectionLost) {
+            setIsConnectionLost(false);
+            setReconnectCount(0);
+            AuditLogger.info('SYSTEM', 'CONNECTION_RESTORED', 'تمت استعادة الاتصال بنجاح واستئناف عمل البوت.');
+            showToast('🟢 تمت استعادة الاتصال بنجاح واستئناف عمل البوت بالبيانات الحية!');
+          }
+        }
+      } catch (err: any) {
+        if (!isConnectionLost) {
+          setIsConnectionLost(true);
+          AuditLogger.critical('SYSTEM', 'CONNECTION_LOST', `فشل جلب الأسعار الحية من بينانس: ${err?.message || 'انقطاع الاتصال'}. تم إيقاف عمل البوت فورياً لحظر البيانات الوهمية.`);
+        }
       }
     };
 
     fetchPrices();
     const interval = setInterval(fetchPrices, 4000);
     return () => clearInterval(interval);
-  }, []);
+  }, [isConnectionLost]);
 
   // 2. Active Trades Management & Smart Exit Engine Loop
   useEffect(() => {
     if (activeTrades.length === 0) return;
 
     const interval = setInterval(() => {
+      // Strict: Halt trade exit evaluation when disconnected to avoid calculating on missing or stale prices
+      if (isConnectionLost || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+        return;
+      }
+
       setActiveTrades(prevActive => {
         let hasChanges = false;
         const remainingTrades: Trade[] = [];
@@ -344,20 +456,37 @@ export default function App() {
 
   // 3. Manual or Periodic 7-Timeframe Behavioral Scan
   const runBehavioralScan = useCallback(async (targetCoin?: string) => {
+    // Fail-closed requirement: strictly halt scanning and opening orders when disconnected
+    if (isConnectionLost || (typeof navigator !== 'undefined' && !navigator.onLine)) {
+      AuditLogger.warn('STRATEGY', 'SCAN_BLOCKED_DISCONNECTED', 'محاولة مسح ملغاة: تم إيقاف البوت بسبب انقطاع الاتصال لحظر البيانات الوهمية.');
+      return;
+    }
+
     setIsScanningNow(true);
     const coinsToScan = targetCoin ? [targetCoin] : SUPPORTED_COINS.map(c => c.symbol);
 
     try {
       for (const coin of coinsToScan) {
-        // Fetch candle data for base frame 15m
-        const candles15m = await BinanceService.getCandles(coin, '15m', 30);
-        const swingResult = BehaviorEngine.detectSwingAndPattern(coin, '15m', candles15m, settings.minMagnitudePct);
+        // 1. Fetch candles with execution mode enforcement (Fail-closed on LIVE and PAPER if disconnected)
+        const candles15m = await MarketDataLayer.fetchCandles(
+          coin, 
+          '15m', 
+          30, 
+          settings.marketType || 'USDT_M_FUTURES', 
+          settings.tradingExecutionMode || 'PAPER'
+        );
+
+        if (!candles15m || candles15m.length < 10) {
+          continue;
+        }
+
+        const swingResult = BehaviorEngine.detectSwingAndPattern(coin, '15m', candles15m, settings.minMovementPct || 0.5);
 
         if (swingResult) {
           const { swing, patternTag } = swingResult;
-          // Look up pattern stats
           const patternStat = BehaviorEngine.findPatternStats(patternTag, patterns);
           const currentPrice = tickers[coin]?.price || swing.endPrice;
+          const regime = RegimeDetector.detect(candles15m);
 
           // Build multi-TF alignment
           const mockSignals = TIMEFRAMES.map(tf => {
@@ -378,7 +507,7 @@ export default function App() {
             mockSignals
           );
 
-          // Evaluate 5-step decision with Anti-Repetition logic
+          // 2. Evaluate 5-step decision with Anti-Repetition logic and regime awareness
           const decision = BehaviorEngine.makeDecision(
             coin,
             '15m',
@@ -390,46 +519,74 @@ export default function App() {
             closedTrades,
             settings,
             stats,
-            disqualifiedPatterns
+            disqualifiedPatterns,
+            settings.tradingExecutionMode === 'LIVE' ? 'REAL_MARKET' : 'SYNTHETIC',
+            regime
           );
 
-          // If decision is approved and we have room for trade, execute!
-          if (decision.status === 'APPROVED' && decision.proposedTrade) {
-            const newTrade: Trade = {
-              id: `tr-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+          const tradeDirection = decision.direction === 'UP' ? 'LONG' : 'SHORT';
+
+          // 3. Risk Engine Verification & Order Management Execution
+          if (decision.status === 'APPROVED' && decision.proposedTrade && settings.autoTradingEnabled) {
+            const riskCheck = RiskEngine.evaluateTrade(
               coin,
-              timeframe: '15m',
-              direction: decision.direction === 'UP' ? 'LONG' : 'SHORT',
-              entryPrice: decision.proposedTrade.entryPrice,
-              currentPrice: decision.proposedTrade.entryPrice,
-              peakPrice: decision.proposedTrade.entryPrice,
-              targetPrice: decision.proposedTrade.targetPrice,
-              stopLossPrice: decision.proposedTrade.stopLossPrice,
-              targetPct: decision.proposedTrade.targetPct,
-              stopLossPct: decision.proposedTrade.stopLossPct,
-              sizeUsd: decision.proposedTrade.sizeUsd,
-              leverage: settings.leverage || 10,
-              marginUsd: Number(((decision.proposedTrade.sizeUsd) / (settings.leverage || 10)).toFixed(2)),
-              entryTime: Date.now(),
-              durationMinutes: 0,
-              expectedDurationMinutes: decision.proposedTrade.expectedDurationMins,
-              status: 'OPEN',
-              patternTag,
-              confidence: decision.finalConfidence,
-              supportingTimeframesCount: decision.supportingCount,
-              currentPnLUsd: 0,
-              currentPnLPct: 0,
-              peakPnLPct: 0,
-              isTrailingActive: false,
-            };
+              tradeDirection,
+              decision.proposedTrade.entryPrice,
+              decision.proposedTrade.targetPct,
+              decision.proposedTrade.stopLossPct,
+              activeTrades,
+              stats,
+              settings
+            );
 
-            setActiveTrades(prev => {
-              const updated = [newTrade, ...prev];
-              StorageService.saveActiveTrades(updated);
-              return updated;
-            });
+            if (!riskCheck.approved) {
+              AuditLogger.warn('RISK_ENGINE', 'TRADE_BLOCKED_BY_RISK', `حظر صفقة ${coin} عبر محرك المخاطر: ${riskCheck.reasons.join(', ')}`, { symbol: coin, metadata: { reasons: riskCheck.reasons } });
+            } else {
+              const leverage = settings.leverage || 10;
+              const quantity = Number((decision.proposedTrade.sizeUsd / decision.proposedTrade.entryPrice).toFixed(4));
+              const execResult = await OrderManager.executeEntryOrder(
+                coin,
+                tradeDirection,
+                decision.proposedTrade.entryPrice,
+                quantity,
+                decision.proposedTrade.sizeUsd,
+                decision.proposedTrade.targetPrice,
+                decision.proposedTrade.targetPct,
+                decision.proposedTrade.stopLossPrice,
+                decision.proposedTrade.stopLossPct,
+                patternTag,
+                decision.finalConfidence,
+                decision.supportingCount,
+                settings,
+                settings.tradingExecutionMode || 'PAPER'
+              );
 
-            showToast(`🚀 تم فتح صفقة جديدة آلياً: ${coin} ${newTrade.direction} (ثقة ${decision.finalConfidence}%)`);
+              if (execResult.success && execResult.trade) {
+                const newTrade = execResult.trade;
+                setActiveTrades(prev => {
+                  const updated = [newTrade, ...prev];
+                  StorageService.saveActiveTrades(updated);
+                  return updated;
+                });
+
+                AuditLogger.info('ORDER_MANAGER', 'TRADE_EXECUTED', `تم فتح صفقة ${coin} (${tradeDirection}) بحجم $${newTrade.sizeUsd} ورافعة ${leverage}x`, {
+                  symbol: coin,
+                  metadata: {
+                    direction: tradeDirection,
+                    sizeUsd: newTrade.sizeUsd,
+                    orderId: newTrade.orderId,
+                    clientOrderId: newTrade.clientOrderId
+                  }
+                });
+
+                showToast(`🚀 تم فتح صفقة جديدة آلياً: ${coin} ${newTrade.direction} (ثقة ${decision.finalConfidence}% | رافعة ${leverage}x)`);
+              } else {
+                AuditLogger.error('ORDER_MANAGER', 'ORDER_EXECUTION_FAILED', `فشل تنفيذ أمر ${coin}: ${execResult.error}`, {
+                  symbol: coin,
+                  metadata: { error: execResult.error }
+                });
+              }
+            }
           }
 
           // Record decision in log
@@ -445,26 +602,30 @@ export default function App() {
     } finally {
       setIsScanningNow(false);
     }
-  }, [tickers, settings, patterns, activeTrades, closedTrades, stats, disqualifiedPatterns]);
+  }, [tickers, settings, patterns, activeTrades, closedTrades, stats, disqualifiedPatterns, isConnectionLost]);
 
-  // 4. Autonomous Continuous Scan interval (runs every 16 seconds if enabled)
+  // 4. Autonomous Continuous Scan interval (runs every 16 seconds if enabled and connected)
   useEffect(() => {
-    if (!isAutoScanning) return;
+    if (!isAutoScanning || isConnectionLost) return;
     
     // Initial immediate scan after mount
     const timeout = setTimeout(() => {
-      runBehavioralScan();
+      if (!isConnectionLost) {
+        runBehavioralScan();
+      }
     }, 1500);
 
     const interval = setInterval(() => {
-      runBehavioralScan();
+      if (!isConnectionLost) {
+        runBehavioralScan();
+      }
     }, 16000);
 
     return () => {
       clearTimeout(timeout);
       clearInterval(interval);
     };
-  }, [isAutoScanning, runBehavioralScan]);
+  }, [isAutoScanning, isConnectionLost, runBehavioralScan]);
 
   // 4.5. Automated Hourly Performance & Trade Reporting (every 60 minutes)
   useEffect(() => {
@@ -939,6 +1100,45 @@ export default function App() {
         </div>
       )}
 
+      {/* Network Disconnection & Fail-Closed Alert Banner */}
+      {isConnectionLost && (
+        <div className="bg-gradient-to-r from-rose-950 via-rose-900 to-amber-950 border-b border-rose-500/70 px-4 py-3 text-white shadow-2xl relative z-40">
+          <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center justify-between gap-3">
+            <div className="flex items-center gap-3 w-full md:w-auto">
+              <div className="p-2 bg-rose-500/20 border border-rose-400/50 rounded-xl shrink-0">
+                <WifiOff className="w-5 h-5 text-rose-300 animate-pulse" />
+              </div>
+              <div className="text-right flex-1">
+                <div className="text-sm font-bold flex flex-wrap items-center gap-2">
+                  <span>انقطع الاتصال بالإنترنت أو خوادم بينانس — تم إيقاف عمل البوت فورياً</span>
+                  <span className="text-[11px] bg-rose-500/30 text-rose-200 border border-rose-400/40 px-2 py-0.5 rounded-md font-mono">
+                    حظر البيانات الوهمية نشط
+                  </span>
+                </div>
+                <p className="text-xs text-rose-200/80 mt-0.5">
+                  لحماية رأس المال ومنع اتخاذ قرارات خاطئة، يتوقف البوت فوراً عند انقطاع الاتصال ولا يتم توليد أو استخدام أي أرقام وهمية في الوضعين الحقيقي والتجريبي. سيتم استئناف العمل آلياً بمجرد عودة الاتصال.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2.5 shrink-0 w-full md:w-auto justify-end">
+              <div className="text-xs font-mono text-amber-300 bg-black/50 px-3 py-1.5 rounded-lg border border-amber-500/30 flex items-center gap-2">
+                <RefreshCw className={`w-3.5 h-3.5 text-amber-400 ${isReconnecting ? 'animate-spin' : ''}`} />
+                <span>محاولة إعادة الاتصال #{reconnectCount}</span>
+              </div>
+              <button
+                onClick={handleManualReconnect}
+                disabled={isReconnecting}
+                className="text-xs font-bold bg-rose-600 hover:bg-rose-500 active:bg-rose-700 disabled:opacity-50 text-white px-3 py-1.5 rounded-lg transition shadow-md flex items-center gap-1.5"
+              >
+                <RotateCw className={`w-3.5 h-3.5 ${isReconnecting ? 'animate-spin' : ''}`} />
+                <span>{isReconnecting ? 'جاري الفحص...' : 'إعادة المحاولة الآن'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Header & Quick Actions */}
       <Header
         activeTab={activeTab}
@@ -958,6 +1158,9 @@ export default function App() {
         totalPatterns={patterns.length}
         hourlyReportsCount={hourlyReports.length}
         disqualifiedCount={disqualifiedPatterns.length}
+        isConnectionLost={isConnectionLost}
+        reconnectCount={reconnectCount}
+        onManualReconnect={handleManualReconnect}
       />
 
       {/* Main Content Area */}
@@ -983,6 +1186,9 @@ export default function App() {
             disqualifiedPatterns={disqualifiedPatterns}
             onExportCurrentHourReport={handleGenerateHourlyReportNow}
             dbStats={dbStats}
+            isConnectionLost={isConnectionLost}
+            reconnectCount={reconnectCount}
+            onManualReconnect={handleManualReconnect}
           />
         )}
 
@@ -1027,6 +1233,18 @@ export default function App() {
         {activeTab === 'analytics' && (
           <AnalyticsTab
             stats={stats}
+          />
+        )}
+
+        {activeTab === 'backtest' && (
+          <BacktestTab
+            settings={settings}
+          />
+        )}
+
+        {activeTab === 'audit' && (
+          <SystemAuditTab
+            settings={settings}
           />
         )}
 

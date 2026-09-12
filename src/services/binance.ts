@@ -1,6 +1,6 @@
 /**
- * Binance API Service — جلب الأسعار والشموع الحقيقية من Binance
- * يدعم Binance Spot/Futures العامة مع محاكي ذكي سلس في حال انقطاع الشبكة
+ * Binance API Service — جلب الأسعار والشموع الحقيقية حصراً من Binance
+ * قاعدة صارمة: حظر توليد أي بيانات أو أرقام أو شموع وهمية في حال انقطاع الاتصال
  */
 
 import { Candle, Timeframe } from '../types';
@@ -12,101 +12,78 @@ export interface TickerData {
   high24h: number;
   low24h: number;
   volume24h: number;
+  lastUpdated: number;
 }
 
-const DEFAULT_PRICES: { [symbol: string]: number } = {
-  'BTCUSDT': 65420.5,
-  'ETHUSDT': 3450.8,
-  'SOLUSDT': 142.75,
-  'BNBUSDT': 585.2,
-  'ADAUSDT': 0.485,
-  'XRPUSDT': 0.582,
-  'DOGEUSDT': 0.1245,
-  'AVAXUSDT': 28.45,
-};
-
 export const BinanceService = {
+  /**
+   * جلب الأسعار الحية الحقيقية فقط
+   * في حال فشل الاتصال، لا يتم توليد أي أرقام وهمية إطلاقاً
+   */
   async fetchLivePrices(): Promise<{ [symbol: string]: TickerData }> {
     const result: { [symbol: string]: TickerData } = {};
-    const symbols = Object.keys(DEFAULT_PRICES);
+    const now = Date.now();
 
+    // 1. محاولة جلب أسعار العقود الآجلة USDT-M أولاً
     try {
-      // Try public Binance Futures ticker first, fallback to Spot ticker
       const response = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr', {
         signal: AbortSignal.timeout(3500)
       });
       if (response.ok) {
         const data = await response.json();
-        if (Array.isArray(data)) {
-          const map = new Map<string, any>();
-          data.forEach((item) => map.set(item.symbol, item));
-
-          for (const sym of symbols) {
-            const item = map.get(sym);
-            if (item) {
-              result[sym] = {
-                symbol: sym,
-                price: parseFloat(item.lastPrice),
-                change24h: parseFloat(item.priceChangePercent),
-                high24h: parseFloat(item.highPrice),
-                low24h: parseFloat(item.lowPrice),
-                volume24h: parseFloat(item.quoteVolume),
+        if (Array.isArray(data) && data.length > 0) {
+          for (const item of data) {
+            const price = parseFloat(item.lastPrice);
+            if (price > 0) {
+              result[item.symbol] = {
+                symbol: item.symbol,
+                price,
+                change24h: parseFloat(item.priceChangePercent || '0'),
+                high24h: parseFloat(item.highPrice || '0'),
+                low24h: parseFloat(item.lowPrice || '0'),
+                volume24h: parseFloat(item.quoteVolume || '0'),
+                lastUpdated: now,
               };
             }
           }
+          return result;
         }
       }
-    } catch (err) {
-      // Try Spot fallback
-      try {
-        const spotRes = await fetch('https://api.binance.com/api/v3/ticker/24hr', {
-          signal: AbortSignal.timeout(2500)
-        });
-        if (spotRes.ok) {
-          const data = await spotRes.json();
-          if (Array.isArray(data)) {
-            const map = new Map<string, any>();
-            data.forEach((item) => map.set(item.symbol, item));
+    } catch (futuresErr) {
+      // محاولة بديلة عبر Spot API قبل إعلان انقطاع الاتصال
+    }
 
-            for (const sym of symbols) {
-              const item = map.get(sym);
-              if (item) {
-                result[sym] = {
-                  symbol: sym,
-                  price: parseFloat(item.lastPrice),
-                  change24h: parseFloat(item.priceChangePercent),
-                  high24h: parseFloat(item.highPrice),
-                  low24h: parseFloat(item.lowPrice),
-                  volume24h: parseFloat(item.quoteVolume),
-                };
-              }
+    // 2. محاولة بديلة عبر Binance Spot API
+    try {
+      const spotRes = await fetch('https://api.binance.com/api/v3/ticker/24hr', {
+        signal: AbortSignal.timeout(3000)
+      });
+      if (spotRes.ok) {
+        const data = await spotRes.json();
+        if (Array.isArray(data) && data.length > 0) {
+          for (const item of data) {
+            const price = parseFloat(item.lastPrice);
+            if (price > 0) {
+              result[item.symbol] = {
+                symbol: item.symbol,
+                price,
+                change24h: parseFloat(item.priceChangePercent || '0'),
+                high24h: parseFloat(item.highPrice || '0'),
+                low24h: parseFloat(item.lowPrice || '0'),
+                volume24h: parseFloat(item.quoteVolume || '0'),
+                lastUpdated: now,
+              };
             }
           }
+          return result;
         }
-      } catch (spotErr) {
-        // Fall back to synthetic realistic ticks
       }
+    } catch (spotErr) {
+      // فشل الاتصال بكلا المصدرين
     }
 
-    // Fill any missing with realistic simulated variation
-    for (const sym of symbols) {
-      if (!result[sym]) {
-        const base = DEFAULT_PRICES[sym];
-        const drift = (Math.random() - 0.49) * 0.002 * base;
-        const price = Number((base + drift).toFixed(sym.includes('DOGE') || sym.includes('ADA') || sym.includes('XRP') ? 4 : 2));
-        DEFAULT_PRICES[sym] = price;
-        result[sym] = {
-          symbol: sym,
-          price,
-          change24h: 1.85,
-          high24h: price * 1.025,
-          low24h: price * 0.978,
-          volume24h: 125000000,
-        };
-      }
-    }
-
-    return result;
+    // تنبيه حاسم: عدم توليد أي بيانات وهمية أو تحريك عشوائي في حال انقطاع الإنترنت!
+    throw new Error('BINANCE_CONNECTION_DISCONNECTED');
   },
 
   getAllTickers(): Promise<{ [symbol: string]: TickerData }> {
@@ -117,6 +94,10 @@ export const BinanceService = {
     return this.fetchKlines(symbol, timeframe, limit);
   },
 
+  /**
+   * جلب الشموع الحقيقية فقط
+   * حظر تام لتوليد شموع وهمية عند انقطاع الاتصال
+   */
   async fetchKlines(symbol: string, timeframe: Timeframe, limit: number = 220): Promise<Candle[]> {
     const tfMap: { [key in Timeframe]: string } = {
       '1m': '1m',
@@ -128,67 +109,80 @@ export const BinanceService = {
       '1d': '1d',
     };
 
+    const interval = tfMap[timeframe] || '15m';
+
+    // 1. تجربة جلب شموع الفيوتشرز أولاً
     try {
-      const interval = tfMap[timeframe];
-      const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+      const url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
       const res = await fetch(url, { signal: AbortSignal.timeout(3500) });
       if (res.ok) {
         const raw = await res.json();
         if (Array.isArray(raw) && raw.length > 0) {
           return raw.map((c: any) => ({
-            timestamp: c[0],
+            timestamp: Number(c[0]),
+            openTime: Number(c[0]),
+            closeTime: Number(c[6]),
             open: parseFloat(c[1]),
             high: parseFloat(c[2]),
             low: parseFloat(c[3]),
             close: parseFloat(c[4]),
             volume: parseFloat(c[5]),
+            isClosed: Date.now() >= Number(c[6]),
+            dataSource: 'REAL_MARKET'
           }));
         }
       }
-    } catch (e) {
-      // Fallback to synthetic klines
+    } catch (fErr) {
+      // تجربة Spot API
     }
 
-    return this.generateSyntheticCandles(symbol, timeframe, limit);
+    // 2. تجربة جلب شموع Spot
+    try {
+      const url = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+      const res = await fetch(url, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        const raw = await res.json();
+        if (Array.isArray(raw) && raw.length > 0) {
+          return raw.map((c: any) => ({
+            timestamp: Number(c[0]),
+            openTime: Number(c[0]),
+            closeTime: Number(c[6]),
+            open: parseFloat(c[1]),
+            high: parseFloat(c[2]),
+            low: parseFloat(c[3]),
+            close: parseFloat(c[4]),
+            volume: parseFloat(c[5]),
+            isClosed: Date.now() >= Number(c[6]),
+            dataSource: 'REAL_MARKET'
+          }));
+        }
+      }
+    } catch (sErr) {
+      // فشل الاتصال
+    }
+
+    // حظر توليد أي شموع وهمية — إرجاع مصفوفة فارغة وإلقاء خطأ الانقطاع
+    throw new Error(`KLINES_DISCONNECTED: فشل جلب الشموع الحقيقية لـ ${symbol} بسبب انقطاع الاتصال`);
   },
 
-  generateSyntheticCandles(symbol: string, timeframe: Timeframe, limit: number = 220): Candle[] {
-    const candles: Candle[] = [];
-    let currentPrice = DEFAULT_PRICES[symbol] || 65000;
-    const tfMinutes: { [key in Timeframe]: number } = {
-      '1m': 1,
-      '5m': 5,
-      '15m': 15,
-      '30m': 30,
-      '1h': 60,
-      '4h': 240,
-      '1d': 1440,
-    };
-    const stepMs = tfMinutes[timeframe] * 60 * 1000;
-    const now = Date.now();
-
-    for (let i = limit; i >= 0; i--) {
-      const time = now - i * stepMs;
-      const volatility = currentPrice * 0.003;
-      const delta = (Math.random() - 0.49) * volatility;
-      const open = currentPrice;
-      const close = open + delta;
-      const high = Math.max(open, close) + Math.random() * volatility * 0.5;
-      const low = Math.min(open, close) - Math.random() * volatility * 0.5;
-      const volume = Math.floor(Math.random() * 500) + 50;
-
-      candles.push({
-        timestamp: time,
-        open: Number(open.toFixed(2)),
-        high: Number(high.toFixed(2)),
-        low: Number(low.toFixed(2)),
-        close: Number(close.toFixed(2)),
-        volume,
+  /**
+   * فحص الاتصال بالإنترنت وبخوادم بينانس
+   */
+  async ping(): Promise<boolean> {
+    try {
+      const res = await fetch('https://fapi.binance.com/fapi/v1/ping', {
+        signal: AbortSignal.timeout(2000)
       });
-
-      currentPrice = close;
+      return res.ok;
+    } catch {
+      try {
+        const res2 = await fetch('https://api.binance.com/api/v3/ping', {
+          signal: AbortSignal.timeout(2000)
+        });
+        return res2.ok;
+      } catch {
+        return false;
+      }
     }
-
-    return candles;
   }
 };

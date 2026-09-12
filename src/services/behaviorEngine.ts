@@ -18,63 +18,26 @@ import {
   UserStats,
   HourlyReport,
   DisqualifiedPattern,
+  DataSource,
+  MarketRegime,
   TIMEFRAMES 
 } from '../types';
+import { TechnicalRSI } from './math/rsi';
+import { TechnicalADX } from './math/adx';
+import { PatternSimilarity } from './learning/similarity';
+import { ProbabilityCalibration } from './learning/calibration';
+import { FinancialMath } from './math/financial';
 
 export const BehaviorEngine = {
   /**
-   * حساب المؤشرات الفنية الأساسية (RSI و ADX) للشمعات
+   * حساب المؤشرات الفنية الأساسية (RSI و ADX) باستخدام المعايير القياسية
    */
   calculateRSI(closes: number[], period: number = 14): number {
-    if (closes.length < period + 1) return 50;
-    let gains = 0;
-    let losses = 0;
-
-    for (let i = closes.length - period; i < closes.length; i++) {
-      const diff = closes[i] - closes[i - 1];
-      if (diff >= 0) gains += diff;
-      else losses -= diff;
-    }
-
-    const avgGain = gains / period;
-    const avgLoss = losses / period;
-    if (avgLoss === 0) return 100;
-    const rs = avgGain / avgLoss;
-    return Math.round(100 - (100 / (1 + rs)));
+    return TechnicalRSI.calculate(closes, period);
   },
 
   calculateADX(candles: Candle[], period: number = 14): number {
-    if (candles.length < period * 2) return 28;
-    // Fast estimation of Trend Strength
-    let trSum = 0;
-    let dmPlusSum = 0;
-    let dmMinusSum = 0;
-
-    for (let i = candles.length - period; i < candles.length; i++) {
-      const prev = candles[i - 1];
-      const curr = candles[i];
-      const tr = Math.max(
-        curr.high - curr.low,
-        Math.abs(curr.high - prev.close),
-        Math.abs(curr.low - prev.close)
-      );
-      trSum += tr;
-
-      const upMove = curr.high - prev.high;
-      const downMove = prev.low - curr.low;
-
-      if (upMove > downMove && upMove > 0) dmPlusSum += upMove;
-      if (downMove > upMove && downMove > 0) dmMinusSum += downMove;
-    }
-
-    if (trSum === 0) return 25;
-    const diPlus = (dmPlusSum / trSum) * 100;
-    const diMinus = (dmMinusSum / trSum) * 100;
-    const diff = Math.abs(diPlus - diMinus);
-    const sum = diPlus + diMinus;
-    if (sum === 0) return 25;
-    const dx = (diff / sum) * 100;
-    return Math.min(60, Math.max(15, Math.round(dx)));
+    return TechnicalADX.calculate(candles, period).adx;
   },
 
   /**
@@ -262,29 +225,45 @@ export const BehaviorEngine = {
     closedTrades: Trade[],
     settings: StrategySettings,
     stats: UserStats,
-    disqualifiedPatterns: DisqualifiedPattern[] = []
+    disqualifiedPatterns: DisqualifiedPattern[] = [],
+    dataSource: DataSource = 'REAL_MARKET',
+    currentRegime: MarketRegime = 'RANGE'
   ): DecisionLog {
     const now = Date.now();
     const currentUtcHour = new Date(now).getUTCHours();
     const reasons: string[] = [];
     const reviewSteps: DecisionStepReview[] = [];
 
-    // Step 1: Pattern Criteria Review
+    // Step 1: Pattern Criteria & Multi-Dimensional Similarity Review
     let patternPassed = false;
     let initialConfidence = 50;
+    let similarity = pattern ? PatternSimilarity.calculateSimilarity(patternTag, pattern, currentRegime) : undefined;
+
     if (pattern) {
       initialConfidence = pattern.confidence || Math.round(pattern.continuationRate);
       const occPassed = pattern.occurrences >= settings.minOccurrences;
       const confPassed = initialConfidence >= settings.minConfidence;
-      patternPassed = occPassed && confPassed;
+      const simPassed = !similarity || similarity.score >= (settings.minSimilarityPct || 75);
+      patternPassed = occPassed && confPassed && simPassed;
 
       reviewSteps.push({
         name: 'فحص النمط وتكراره التاريخي',
-        passed: patternPassed,
+        passed: occPassed && confPassed,
         detail: `تكرر ${pattern.occurrences} مرة (المطلوب ≥ ${settings.minOccurrences}) | الثقة الأولية: ${initialConfidence}% (المطلوب ≥ ${settings.minConfidence}%)`,
         metric: `${pattern.occurrences} تكرار`,
         threshold: `≥ ${settings.minOccurrences}`,
       });
+
+      if (similarity) {
+        reviewSteps.push({
+          name: 'المطابقة السلوكية المتعددة الأبعاد (Pattern Similarity)',
+          passed: simPassed,
+          detail: `درجة التشابه: ${similarity.score}% (المطلوب ≥ ${settings.minSimilarityPct || 75}%) | تطابق النظام: ${similarity.regimeMatch ? 'نعم' : 'لا'}`,
+          metric: `${similarity.score}%`,
+          threshold: `≥ ${settings.minSimilarityPct || 75}%`
+        });
+        if (!simPassed) reasons.push(`درجة تشابه النمط (${similarity.score}%) أقل من الحد الأدنى (${settings.minSimilarityPct || 75}%)`);
+      }
 
       if (!occPassed) reasons.push(`عدد التكرارات في الذاكرة (${pattern.occurrences}) أقل من الحد الأدنى (${settings.minOccurrences})`);
       if (!confPassed) reasons.push(`الثقة الأولية (${initialConfidence}%) أقل من الحد الأدنى (${settings.minConfidence}%)`);
@@ -468,6 +447,12 @@ export const BehaviorEngine = {
       };
     }
 
+    const calibratedConfidence = ProbabilityCalibration.calibrate(
+      finalConfidence,
+      pattern ? pattern.occurrences : 0,
+      pattern ? pattern.continuedCount : 0
+    );
+
     return {
       id: `dec-${now}-${Math.floor(Math.random() * 1000)}`,
       timestamp: now,
@@ -479,6 +464,10 @@ export const BehaviorEngine = {
       initialConfidence,
       adjustedConfidence: alignment.adjustedConfidence,
       finalConfidence,
+      calibratedConfidence,
+      similarity,
+      dataSource,
+      marketRegime: currentRegime,
       supportingCount: alignment.supportingCount,
       opposingCount: alignment.opposingCount,
       reasons,
@@ -496,12 +485,12 @@ export const BehaviorEngine = {
     settings: StrategySettings
   ): { updatedTrade: Trade; shouldClose: boolean; reason?: string } {
     const isLong = trade.direction === 'LONG';
-    const priceDiffPct = isLong
-      ? ((currentPrice - trade.entryPrice) / trade.entryPrice) * 100
-      : ((trade.entryPrice - currentPrice) / trade.entryPrice) * 100;
-
-    const currentPnLPct = Number(priceDiffPct.toFixed(2));
-    const currentPnLUsd = Number(((currentPnLPct / 100) * trade.sizeUsd).toFixed(2));
+    const qty = trade.quantity || (trade.sizeUsd / trade.entryPrice);
+    const grossPnLUsd = FinancialMath.calcPnL(trade.direction, trade.entryPrice, currentPrice, qty);
+    const feesPaid = trade.feesPaidUsd || 0;
+    const currentPnLUsd = FinancialMath.round(grossPnLUsd - feesPaid, 2);
+    const currentPnLPct = FinancialMath.calcReturnPct(currentPnLUsd, trade.marginUsd || (trade.sizeUsd / trade.leverage));
+    
     const peakPrice = isLong ? Math.max(trade.peakPrice, currentPrice) : Math.min(trade.peakPrice, currentPrice);
     const peakPnLPct = Math.max(trade.peakPnLPct, currentPnLPct);
 

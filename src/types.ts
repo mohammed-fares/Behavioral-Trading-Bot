@@ -28,6 +28,23 @@ export const SUPPORTED_COINS = [
 export type Direction = 'UP' | 'DOWN' | 'SIDEWAYS';
 export type OutcomeType = 'CONTINUED' | 'REVERSED' | 'SIDEWAYS';
 
+export type ExecutionMode = 'PAPER' | 'LIVE' | 'SYNTHETIC' | 'BACKTEST';
+export type DataSource = 'REAL_MARKET' | 'PAPER_REAL_MARKET' | 'BACKTEST' | 'SYNTHETIC' | 'DEMO_SEED' | 'STALE' | 'DATA_UNAVAILABLE';
+export type MarketType = 'SPOT' | 'USDT_M_FUTURES';
+export type MarketRegime = 'TREND_UP' | 'TREND_DOWN' | 'RANGE' | 'HIGH_VOLATILITY' | 'LOW_VOLATILITY';
+
+export type OrderState = 
+  | 'SIGNAL'
+  | 'RISK_CHECK'
+  | 'ORDER_PENDING'
+  | 'PARTIALLY_FILLED'
+  | 'OPEN'
+  | 'PROTECTED'
+  | 'EXIT_PENDING'
+  | 'CLOSED'
+  | 'FAILED'
+  | 'RECONCILIATION_REQUIRED';
+
 export interface Candle {
   timestamp: number;
   open: number;
@@ -35,6 +52,10 @@ export interface Candle {
   low: number;
   close: number;
   volume: number;
+  isClosed?: boolean;
+  openTime?: number;
+  closeTime?: number;
+  dataSource?: DataSource;
 }
 
 export interface Swing {
@@ -77,6 +98,65 @@ export interface PatternStats {
   bestHours: { [hour: number]: { count: number; winRate: number; avgProfit: number } };
   confidence: number; // 0-100%
   lastOccurredAt: number;
+  dataSource?: DataSource;
+  regime?: MarketRegime;
+  sampleSize?: number;
+  confidenceInterval?: { lower: number; upper: number };
+}
+
+export interface SimilarityBreakdown {
+  score: number; // 0 - 100%
+  directionMatch: boolean;
+  magnitudeDiffPct: number;
+  durationDiffMins: number;
+  rsiDiff: number;
+  adxDiff: number;
+  regimeMatch: boolean;
+  isEligible: boolean;
+}
+
+export interface CalibratedConfidence {
+  decisionScore: number;       // raw multi-factor score (0-100)
+  historicalWinRate: number;   // from memory occurrences
+  calibratedProbability: number; // Platt / Brier calibrated win probability (0-1)
+  brierScore?: number;
+  sampleSize: number;
+  isReliable: boolean;
+}
+
+export interface OrderRecord {
+  orderId: string;
+  clientOrderId: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  type: 'MARKET' | 'LIMIT' | 'STOP_MARKET' | 'TAKE_PROFIT_MARKET';
+  price: number;
+  quantity: number;
+  orderedQuantity: number;
+  filledQuantity: number;
+  remainingQuantity: number;
+  averageFillPrice: number;
+  status: 'NEW' | 'PARTIALLY_FILLED' | 'FILLED' | 'CANCELED' | 'REJECTED' | 'EXPIRED';
+  time: number;
+  stopOrderId?: string;
+  takeProfitOrderId?: string;
+  commission: number;
+  commissionAsset?: string;
+  errorMessage?: string;
+  isSimulated: boolean;
+}
+
+export interface AuditLogEntry {
+  id: string;
+  timestamp: number;
+  level: 'INFO' | 'WARN' | 'ERROR' | 'CRITICAL';
+  component: 'MARKET_DATA' | 'STRATEGY' | 'RISK_ENGINE' | 'ORDER_MANAGER' | 'RECONCILIATION' | 'LEARNING' | 'SYSTEM';
+  event: string;
+  symbol?: string;
+  orderId?: string;
+  tradeId?: string;
+  message: string;
+  metadata?: Record<string, any>;
 }
 
 export interface TimeframeSignal {
@@ -125,6 +205,10 @@ export interface DecisionLog {
   initialConfidence: number;
   adjustedConfidence: number;
   finalConfidence: number;
+  calibratedConfidence?: CalibratedConfidence;
+  similarity?: SimilarityBreakdown;
+  dataSource?: DataSource;
+  marketRegime?: MarketRegime;
   supportingCount: number;
   opposingCount: number;
   reasons: string[];
@@ -141,7 +225,7 @@ export interface DecisionLog {
   lessonLearned?: string;
 }
 
-export type ExitReason = 'TAKE_PROFIT' | 'STOP_LOSS' | 'SMART_EXIT' | 'PATTERN_CHANGE' | 'TIMEOUT' | 'MANUAL';
+export type ExitReason = 'TAKE_PROFIT' | 'STOP_LOSS' | 'SMART_EXIT' | 'PATTERN_CHANGE' | 'TIMEOUT' | 'MANUAL' | 'EMERGENCY_STOP' | 'RECONCILIATION_SYNC';
 
 export interface Trade {
   id: string;
@@ -151,6 +235,7 @@ export interface Trade {
   entryPrice: number;
   currentPrice: number;
   sizeUsd: number;
+  quantity?: number;
   leverage: number;
   marginUsd: number;
   targetPrice: number;
@@ -163,7 +248,19 @@ export interface Trade {
   entryTime: number;
   expectedDurationMinutes: number;
   
-  // Tracking
+  // Execution & Tracking
+  dataSource?: DataSource;
+  marketType?: MarketType;
+  orderState?: OrderState;
+  orderId?: string;
+  clientOrderId?: string;
+  stopOrderId?: string;
+  takeProfitOrderId?: string;
+  fillPrice?: number;
+  feesPaidUsd?: number;
+  slippageUsd?: number;
+  liquidationPrice?: number;
+  
   peakPrice: number;
   peakPnLPct: number;
   currentPnLUsd: number;
@@ -184,7 +281,8 @@ export interface Trade {
 
 export interface StrategySettings {
   strategyMode: 'SCALPING' | 'DAY_TRADING' | 'POSITION' | 'AUTO';
-  tradingExecutionMode: 'PAPER' | 'LIVE';
+  tradingExecutionMode: ExecutionMode;
+  marketType: MarketType;
   apiKey?: string;
   apiSecret?: string;
   isApiConnected?: boolean;
@@ -195,6 +293,7 @@ export interface StrategySettings {
   enabledTimeframes: Timeframe[];
   minOccurrences: number;      // e.g. 20
   minConfidence: number;       // e.g. 65%
+  minSimilarityPct: number;    // e.g. 85%
   minMovementPct: number;      // e.g. 0.5%
   minMagnitudePct?: number;     // alias for minMovementPct
   maxPatternAgeDays: number;   // e.g. 90
@@ -218,6 +317,44 @@ export interface StrategySettings {
   hourlyReportAutoExport: boolean;
   hourlyReportIntervalMinutes: number; // default 60 (or 5 for rapid test)
   avoidPastFailedPatterns: boolean;    // default true: strictly avoid repeating past failed strategies/patterns
+  failedPatternCoolingHours?: number;  // default 24
+  maxSpreadPct?: number;               // default 0.05%
+  maxDataAgeSeconds?: number;          // default 15s
+}
+
+export interface BacktestResult {
+  runId: string;
+  symbol: string;
+  timeframe: Timeframe;
+  startTime: number;
+  endTime: number;
+  totalTrades: number;
+  winningTrades: number;
+  losingTrades: number;
+  winRatePct: number;
+  totalReturnPct: number;
+  maxDrawdownPct: number;
+  sharpeRatio: number;
+  sortinoRatio: number;
+  profitFactor: number;
+  expectancyUsd: number;
+  averageWinUsd: number;
+  averageLossUsd: number;
+  totalFeesUsd: number;
+  slippagePaidUsd: number;
+  buyAndHoldReturnPct: number;
+  trades: Trade[];
+}
+
+export interface HealthStatus {
+  backend: 'HEALTHY' | 'DEGRADED' | 'DOWN';
+  binanceApi: 'CONNECTED' | 'DISCONNECTED' | 'NOT_CONFIGURED';
+  marketData: 'REAL_MARKET' | 'STALE' | 'SYNTHETIC' | 'UNAVAILABLE';
+  riskEngine: 'OK' | 'PAUSED' | 'BLOCKED';
+  orderManager: 'READY' | 'RECONCILING' | 'ERROR';
+  reconciliation: 'SYNCED' | 'MISMATCH_DETECTED' | 'INACTIVE';
+  lastServerTimeSync: number;
+  clockSkewMs: number;
 }
 
 export interface DisqualifiedPattern {
