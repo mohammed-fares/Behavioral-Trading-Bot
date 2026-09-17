@@ -101,6 +101,11 @@ export function useTradingBot() {
     handleResetMemory,
     handleExportMemory,
     handleImportMemory,
+    handleMineHistoricalPatterns,
+    handleMineAllCoins,
+    isMining: isMiningPatterns,
+    miningStatus,
+    miningProgress,
   } = useMemoryActions({
     settings,
     setSettings,
@@ -339,5 +344,10 @@ export function useTradingBot() {
     handleResetMemory,
     handleExportMemory,
     handleImportMemory,
+    handleMineHistoricalPatterns,
+    handleMineAllCoins,
+    isMiningPatterns,
+    miningStatus,
+    miningProgress,
   };
 }

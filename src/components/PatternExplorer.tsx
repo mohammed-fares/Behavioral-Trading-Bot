@@ -21,11 +21,13 @@ import {
   AlertOctagon,
   ChevronDown,
   Sliders,
-  CheckCircle2
+  CheckCircle2,
+  Database
 } from 'lucide-react';
 import { PatternStats, Timeframe, TIMEFRAMES, SUPPORTED_COINS } from '../types';
 import { EditRepetitionModal } from './EditRepetitionModal';
 import { PatternDetailCard } from './pattern/PatternDetailCard';
+import { HistoricalMiningModal } from './pattern/HistoricalMiningModal';
 
 interface PatternExplorerProps {
   patterns: PatternStats[];
@@ -33,6 +35,11 @@ interface PatternExplorerProps {
   onSelectPatternForTest?: (pattern: PatternStats) => void;
   onUpdatePatternRepetition?: (tag: string, coin: string, newOccurrences: number, newConfidence?: number) => void;
   onUpdateMinOccurrences?: (newMin: number) => void;
+  onMineHistoricalPatterns?: (symbol: string, timeframe: Timeframe, candleCount: number) => Promise<any>;
+  onMineAllCoins?: (timeframes: Timeframe[], candleCount: number) => Promise<any>;
+  isMining?: boolean;
+  miningStatus?: string | null;
+  miningProgress?: number;
 }
 
 export const PatternExplorer: React.FC<PatternExplorerProps> = ({
@@ -41,13 +48,19 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
   onSelectPatternForTest,
   onUpdatePatternRepetition,
   onUpdateMinOccurrences,
+  onMineHistoricalPatterns,
+  onMineAllCoins,
+  isMining = false,
+  miningStatus = null,
+  miningProgress = 0,
 }) => {
-  const [selectedTf, setSelectedTf] = useState<Timeframe | 'ALL'>('15m');
+  const [selectedTf, setSelectedTf] = useState<Timeframe | 'ALL'>('ALL');
   const [selectedCoin, setSelectedCoin] = useState<string>('ALL');
   const [minOccFilter, setMinOccFilter] = useState<number | 'ALL'>('ALL');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [filterMode, setFilterMode] = useState<'TOP_10' | 'WORST_10' | 'MOST_FREQUENT' | 'ALL'>('ALL');
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [isMiningModalOpen, setIsMiningModalOpen] = useState(false);
   
   const [activePattern, setActivePattern] = useState<PatternStats | null>(
     patterns.find(p => p.tag === 'P-U-1.5-47-R45-68-A25-35') || patterns[0] || null
@@ -71,9 +84,15 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
 
   // Keep activePattern up to date with any changes in patterns array
   useEffect(() => {
-    if (activePattern) {
+    if (!activePattern && patterns.length > 0) {
+      setActivePattern(patterns[0]);
+    } else if (activePattern) {
       const fresh = patterns.find(p => p.tag === activePattern.tag && p.coin === activePattern.coin);
-      if (fresh) setActivePattern(fresh);
+      if (fresh) {
+        setActivePattern(fresh);
+      } else if (patterns.length > 0) {
+        setActivePattern(patterns[0]);
+      }
     }
   }, [patterns]);
 
@@ -154,42 +173,53 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
             </p>
           </div>
 
-          {/* Filter Modes */}
-          <div className="flex flex-wrap items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
+          {/* Actions & Filter Modes */}
+          <div className="flex flex-wrap items-center gap-2">
             <button
-              onClick={() => setFilterMode('ALL')}
-              className={`px-3 py-1.5 rounded-md font-medium transition ${
-                filterMode === 'ALL' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:text-white'
-              }`}
+              type="button"
+              onClick={() => setIsMiningModalOpen(true)}
+              className="px-3.5 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold transition flex items-center gap-1.5 shadow-sm"
             >
-              جميع الأنماط
+              <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
+              تنقيب أنماط حقيقية من Binance
             </button>
-            <button
-              onClick={() => setFilterMode('TOP_10')}
-              className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1 ${
-                filterMode === 'TOP_10' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              <Award className="w-3.5 h-3.5" />
-              أفضل 10
-            </button>
-            <button
-              onClick={() => setFilterMode('WORST_10')}
-              className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1 ${
-                filterMode === 'WORST_10' ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              <AlertOctagon className="w-3.5 h-3.5" />
-              أسوأ 10
-            </button>
-            <button
-              onClick={() => setFilterMode('MOST_FREQUENT')}
-              className={`px-3 py-1.5 rounded-md font-medium transition ${
-                filterMode === 'MOST_FREQUENT' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-bold' : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              الأكثر تكراراً
-            </button>
+
+            <div className="flex flex-wrap items-center gap-1.5 bg-slate-950 p-1 rounded-lg border border-slate-800 text-xs">
+              <button
+                onClick={() => setFilterMode('ALL')}
+                className={`px-3 py-1.5 rounded-md font-medium transition ${
+                  filterMode === 'ALL' ? 'bg-slate-800 text-white border border-slate-700' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                جميع الأنماط
+              </button>
+              <button
+                onClick={() => setFilterMode('TOP_10')}
+                className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1 ${
+                  filterMode === 'TOP_10' ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Award className="w-3.5 h-3.5" />
+                أفضل 10
+              </button>
+              <button
+                onClick={() => setFilterMode('WORST_10')}
+                className={`px-3 py-1.5 rounded-md font-medium transition flex items-center gap-1 ${
+                  filterMode === 'WORST_10' ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <AlertOctagon className="w-3.5 h-3.5" />
+                أسوأ 10
+              </button>
+              <button
+                onClick={() => setFilterMode('MOST_FREQUENT')}
+                className={`px-3 py-1.5 rounded-md font-medium transition ${
+                  filterMode === 'MOST_FREQUENT' ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30 font-bold' : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                الأكثر تكراراً
+              </button>
+            </div>
           </div>
         </div>
 
@@ -300,6 +330,43 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
         </div>
       </div>
 
+      {/* Zero Data State Alert & Quick Mining */}
+      {patterns.length === 0 && (
+        <div className="bg-slate-900/95 border border-emerald-500/30 rounded-2xl p-8 text-center space-y-4 shadow-xl">
+          <div className="w-14 h-14 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center mx-auto text-emerald-400">
+            <Database className="w-7 h-7" />
+          </div>
+          <div className="max-w-md mx-auto space-y-1.5">
+            <h3 className="text-base font-bold text-white">
+              مستكشف الأنماط جاهز للتحليل الحقيقي (0 بيانات وهمية)
+            </h3>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              الذاكرة خالية من أي أنماط مصطنعة أو وهمية. يمكنك الآن بنقرة واحدة بدء استكشاف وتعدين الأنماط السلوكية الحقيقية من منصة بينانس للعملات الرئيسية أو لجميع العملات معاً.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-center gap-3 pt-2">
+            <button
+              type="button"
+              onClick={() => onMineAllCoins?.(['15m', '1h'], 1000)}
+              disabled={isMining}
+              className="px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-2 transition shadow-lg shadow-emerald-500/20"
+            >
+              <Sparkles className="w-4 h-4" />
+              بدء التنقيب لجميع العملات الـ 8 من بينانس (16,000 شمعة)
+            </button>
+            <button
+              type="button"
+              onClick={() => setIsMiningModalOpen(true)}
+              disabled={isMining}
+              className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-white font-medium text-xs flex items-center gap-2 border border-slate-700 transition"
+            >
+              <Sliders className="w-4 h-4 text-cyan-400" />
+              تخصيص العملة وعمق الشموع
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Main Split: Patterns List (Left/Right) & Deep Dive Detail Card */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* List of Patterns (5 cols) */}
@@ -336,6 +403,11 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
                       <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
                         {p.timeframe}
                       </span>
+                      {(p.dataSource === 'REAL_MARKET' || (p as any).dataSource === 'BINANCE_REAL') && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono font-bold tracking-tight">
+                          BINANCE REAL
+                        </span>
+                      )}
                     </div>
 
                     <div className="flex items-center gap-2 font-mono text-xs">
@@ -401,6 +473,17 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
           onUpdateMinOccurrences={onUpdateMinOccurrences}
         />
       )}
+
+      {/* Historical Mining Modal */}
+      <HistoricalMiningModal
+        isOpen={isMiningModalOpen}
+        onClose={() => setIsMiningModalOpen(false)}
+        onMineHistoricalPatterns={onMineHistoricalPatterns || (async () => {})}
+        onMineAllCoins={onMineAllCoins || (async () => {})}
+        isMining={isMining}
+        miningStatus={miningStatus}
+        miningProgress={miningProgress}
+      />
     </div>
   );
 };

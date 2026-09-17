@@ -1,6 +1,7 @@
-import React, { useCallback } from 'react';
+import React, { useState, useCallback } from 'react';
 import { StorageService } from '../services/storage';
-import { StrategySettings, PatternStats, UserStats, Swing, Trade, DecisionLog } from '../types';
+import { StrategySettings, PatternStats, UserStats, Swing, Trade, DecisionLog, Timeframe, SUPPORTED_COINS } from '../types';
+import { mineHistoricalPatterns, mergeMinedPatterns, mineMultipleSymbols } from '../services/behavior/historicalPatternMiner';
 
 interface UseMemoryActionsProps {
   settings: StrategySettings;
@@ -162,6 +163,76 @@ export function useMemoryActions({
     }
   }, [setStats, setPatterns, setSwings, setActiveTrades, setClosedTrades, setDecisionLogs, showToast]);
 
+  const [isMining, setIsMining] = useState<boolean>(false);
+  const [miningStatus, setMiningStatus] = useState<string | null>(null);
+  const [miningProgress, setMiningProgress] = useState<number>(0);
+
+  const handleMineHistoricalPatterns = useCallback(async (
+    symbol: string,
+    timeframe: Timeframe,
+    candleCount: number = 1000
+  ) => {
+    setIsMining(true);
+    setMiningProgress(10);
+    setMiningStatus(`جاري بدء تنقيب الأنماط الحقيقية لـ ${symbol} (${timeframe})...`);
+    try {
+      const result = await mineHistoricalPatterns({ symbol, timeframe, candleCount }, (msg) => {
+        setMiningStatus(msg);
+      });
+      setMiningProgress(80);
+      const current = StorageService.getPatterns();
+      const merged = mergeMinedPatterns(current, result.patterns);
+      StorageService.savePatterns(merged);
+      StorageService.saveSwings((StorageService.getSwings() || []).concat(result.swings).slice(-1000));
+      setPatterns(merged);
+      setSwings(StorageService.getSwings());
+      setMiningProgress(100);
+      showToast(`تم استكشاف وحفظ ${result.patternsFound} نمطاً حقيقياً لـ ${symbol}!`);
+      return result;
+    } catch (err: any) {
+      showToast(`فشل التنقيب: ${err.message || 'خطأ في الاتصال'}`);
+      throw err;
+    } finally {
+      setTimeout(() => {
+        setIsMining(false);
+        setMiningStatus(null);
+        setMiningProgress(0);
+      }, 1500);
+    }
+  }, [setPatterns, setSwings, showToast]);
+
+  const handleMineAllCoins = useCallback(async (
+    timeframes: Timeframe[] = ['15m', '1h'],
+    candlesPerBatch: number = 1000
+  ) => {
+    setIsMining(true);
+    setMiningProgress(5);
+    const symbols = SUPPORTED_COINS.map(c => c.symbol);
+    try {
+      const res = await mineMultipleSymbols(symbols, timeframes, candlesPerBatch, (msg, pct) => {
+        setMiningStatus(msg);
+        setMiningProgress(pct);
+      });
+      const current = StorageService.getPatterns();
+      const merged = mergeMinedPatterns(current, res.patterns);
+      StorageService.savePatterns(merged);
+      StorageService.saveSwings((StorageService.getSwings() || []).concat(res.swings).slice(-1000));
+      setPatterns(merged);
+      setSwings(StorageService.getSwings());
+      showToast(`اكتمل التنقيب الشامل: ${merged.length} نمطاً حقيقياً متوفراً في الذاكرة!`);
+      return res;
+    } catch (err: any) {
+      showToast(`فشل التنقيب: ${err.message || 'خطأ غير متوقع'}`);
+      throw err;
+    } finally {
+      setTimeout(() => {
+        setIsMining(false);
+        setMiningStatus(null);
+        setMiningProgress(0);
+      }, 1500);
+    }
+  }, [setPatterns, setSwings, showToast]);
+
   return {
     handleSaveSettings,
     handleUpdatePatternRepetition,
@@ -169,5 +240,10 @@ export function useMemoryActions({
     handleResetMemory,
     handleExportMemory,
     handleImportMemory,
+    handleMineHistoricalPatterns,
+    handleMineAllCoins,
+    isMining,
+    miningStatus,
+    miningProgress,
   };
 }

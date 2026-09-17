@@ -114,6 +114,11 @@ export default function App() {
             minOccurrences={bot.settings.minOccurrences}
             onUpdatePatternRepetition={bot.handleUpdatePatternRepetition}
             onUpdateMinOccurrences={bot.handleUpdateMinOccurrences}
+            onMineHistoricalPatterns={bot.handleMineHistoricalPatterns}
+            onMineAllCoins={bot.handleMineAllCoins}
+            isMining={bot.isMiningPatterns}
+            miningStatus={bot.miningStatus}
+            miningProgress={bot.miningProgress}
           />
         )}
 
