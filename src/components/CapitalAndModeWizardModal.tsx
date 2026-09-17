@@ -24,6 +24,8 @@ import {
   Layers
 } from 'lucide-react';
 import { StrategySettings, UserStats } from '../types';
+import { WizardLiveApiConfig } from './wizard/WizardLiveApiConfig';
+import { WizardCalculatedPreview } from './wizard/WizardCalculatedPreview';
 
 interface CapitalAndModeWizardModalProps {
   isOpen: boolean;
@@ -276,55 +278,15 @@ export const CapitalAndModeWizardModal: React.FC<CapitalAndModeWizardModalProps>
 
             {/* If Live mode selected: API Keys configuration */}
             {executionMode === 'LIVE' && (
-              <div className="mt-3 p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-3 animate-in fade-in duration-150">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-slate-300 font-semibold text-xs">
-                    <Lock className="w-3.5 h-3.5 text-amber-400" />
-                    مفاتيح الربط مع Binance Futures (API Credentials)
-                  </div>
-                  <span className="text-[10px] text-slate-500">محفوظة محلياً في متصفحك فقط ولا ترسل لأي خادم</span>
-                </div>
-
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  <div>
-                    <label className="text-slate-400 block mb-1 text-[11px]">Binance API Key</label>
-                    <input
-                      type="password"
-                      placeholder="أدخل مفتاح API Key..."
-                      value={apiKey}
-                      onChange={(e) => setApiKey(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-emerald-500"
-                    />
-                  </div>
-                  <div>
-                    <label className="text-slate-400 block mb-1 text-[11px]">Binance API Secret</label>
-                    <input
-                      type="password"
-                      placeholder="أدخل مفتاح API Secret..."
-                      value={apiSecret}
-                      onChange={(e) => setApiSecret(e.target.value)}
-                      className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-white font-mono text-xs focus:outline-none focus:border-emerald-500"
-                    />
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between pt-1">
-                  <button
-                    type="button"
-                    onClick={handleTestApi}
-                    disabled={isTestingApi}
-                    className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold flex items-center gap-1.5 transition"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${isTestingApi ? 'animate-spin text-emerald-400' : ''}`} />
-                    <span>فحص اتصال API بالحساب الحقيقي</span>
-                  </button>
-                  {apiTestResult && (
-                    <span className={`text-xs font-medium ${apiTestResult.success ? 'text-emerald-400' : 'text-amber-400'}`}>
-                      {apiTestResult.message}
-                    </span>
-                  )}
-                </div>
-              </div>
+              <WizardLiveApiConfig
+                apiKey={apiKey}
+                apiSecret={apiSecret}
+                isTestingApi={isTestingApi}
+                apiTestResult={apiTestResult}
+                onApiKeyChange={setApiKey}
+                onApiSecretChange={setApiSecret}
+                onTestApi={handleTestApi}
+              />
             )}
           </div>
 
@@ -452,45 +414,7 @@ export const CapitalAndModeWizardModal: React.FC<CapitalAndModeWizardModalProps>
             </div>
 
             {/* Live Auto-Configuration Matrix computed from Capital */}
-            <div className="p-4 rounded-xl bg-slate-900 border border-slate-800">
-              <div className="text-[11px] font-bold text-slate-300 mb-2 flex items-center justify-between font-sans">
-                <span className="flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-emerald-400" />
-                  النتائج التلقائية المحسوبة لرأس مال ${capital.toLocaleString()}:
-                </span>
-                <span className="text-[10px] text-emerald-400 font-mono">حساب رياضي دقيق</span>
-              </div>
-
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 font-mono text-xs">
-                <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-                  <div className="text-[10px] text-slate-400">هامش الصفقة الواحدة</div>
-                  <div className="text-sm font-bold text-emerald-400 mt-0.5">
-                    ${calculated.marginPerTrade} ({calculated.positionPct}%)
-                  </div>
-                </div>
-
-                <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-                  <div className="text-[10px] text-slate-400">حجم العقد بالرافعة</div>
-                  <div className="text-sm font-bold text-cyan-400 mt-0.5">
-                    ${calculated.sizeUsdPerTrade} ({calculated.lev}x)
-                  </div>
-                </div>
-
-                <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-                  <div className="text-[10px] text-slate-400">أقصى حد خسارة يومي</div>
-                  <div className="text-sm font-bold text-rose-400 mt-0.5">
-                    -${calculated.dailyRiskStopUsd} ({calculated.dailyLossPct}%)
-                  </div>
-                </div>
-
-                <div className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-                  <div className="text-[10px] text-slate-400">الصفقات المتزامنة</div>
-                  <div className="text-sm font-bold text-amber-400 mt-0.5">
-                    {calculated.maxConcurrent} صفقات كحد أقصى
-                  </div>
-                </div>
-              </div>
-            </div>
+            <WizardCalculatedPreview capital={capital} calculated={calculated} />
 
             {/* Autonomous Continuous Trading Toggle */}
             <div className="flex items-center justify-between p-3 rounded-xl bg-slate-900 border border-slate-800">

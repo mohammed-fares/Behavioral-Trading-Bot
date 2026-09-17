@@ -6,6 +6,19 @@
 import { MarketRegime, Candle } from '../../types';
 import { TechnicalADX } from '../math/adx';
 import { TechnicalRSI } from '../math/rsi';
+import { calculateATR } from '../math/financial';
+
+export function detectMarketRegime(candles: Candle[]): 'TRENDING' | 'RANGING' | 'VOLATILE' {
+  if (!candles || candles.length < 20) return 'RANGING';
+  const adx = TechnicalADX.calculate(candles, 14);
+  const atr = calculateATR(candles, 14);
+  const avgPrice = candles.slice(-20).reduce((s, c) => s + c.close, 0) / 20;
+  const atrPct = avgPrice > 0 ? (atr / avgPrice) * 100 : 0;
+  
+  if (adx.adx > 30) return 'TRENDING';
+  if (atrPct > 3) return 'VOLATILE';
+  return 'RANGING';
+}
 
 export const RegimeDetector = {
   detect(candles: Candle[]): MarketRegime {

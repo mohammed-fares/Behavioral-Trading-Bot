@@ -37,7 +37,7 @@ interface HeaderProps {
   isAutoScanning: boolean;
   setIsAutoScanning: React.Dispatch<React.SetStateAction<boolean>>;
   onManualScan: () => void;
-  onOpenScenarios: () => void;
+  onSwitchExecutionMode: (mode: 'PAPER' | 'LIVE') => void;
   onOpenTestScanModal: () => void;
   onOpenCapitalWizard: () => void;
   onOpenCleanStart: () => void;
@@ -60,7 +60,7 @@ export const Header: React.FC<HeaderProps> = ({
   isAutoScanning,
   setIsAutoScanning,
   onManualScan,
-  onOpenScenarios,
+  onSwitchExecutionMode,
   onOpenTestScanModal,
   onOpenCapitalWizard,
   onOpenCleanStart,
@@ -121,13 +121,43 @@ export const Header: React.FC<HeaderProps> = ({
 
         {/* Live Metrics Pill Group */}
         <div className="flex items-center gap-2 sm:gap-3 overflow-x-auto py-1">
-          {/* Capital & Mode Switcher Quick Button */}
+          {/* Explicit Segmented Mode Switcher (Paper vs Live) */}
+          <div className="flex items-center p-1 bg-slate-950 rounded-xl border border-slate-800 shadow-inner">
+            <button
+              type="button"
+              onClick={() => onSwitchExecutionMode('PAPER')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                !isLive
+                  ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30 ring-1 ring-emerald-400/40'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/60'
+              }`}
+              title="التبديل إلى نظام التداول التجريبي (محاكاة آمنة بأسعار حقيقية)"
+            >
+              <span className={`w-2 h-2 rounded-full ${!isLive ? 'bg-white animate-pulse' : 'bg-emerald-500/50'}`} />
+              <span>تجريبي (Paper)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => onSwitchExecutionMode('LIVE')}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${
+                isLive
+                  ? 'bg-rose-600 text-white shadow-md shadow-rose-600/30 ring-1 ring-rose-400/40'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/60'
+              }`}
+              title="التبديل إلى نظام التداول الحقيقي (Binance Futures المباشر)"
+            >
+              <span className={`w-2 h-2 rounded-full ${isLive ? 'bg-white animate-ping' : 'bg-rose-500/50'}`} />
+              <span>حقيقي (Live)</span>
+            </button>
+          </div>
+
+          {/* Capital Settings Quick Button */}
           <button
             onClick={onOpenCapitalWizard}
-            title="تحديد رأس المال واختيار التداول الحقيقي أو الوهمي"
+            title="تعديل رأس المال وضوابط المخاطر"
             className={`flex items-center gap-2 px-3 py-1.5 rounded-xl border transition ${
               isLive 
-                ? 'bg-rose-950/40 border-rose-500/50 hover:bg-rose-900/50 text-rose-200' 
+                ? 'bg-rose-950/30 border-rose-500/40 hover:bg-rose-900/40 text-rose-200' 
                 : 'bg-slate-950/80 border-slate-800 hover:border-emerald-500/50 text-slate-200'
             }`}
           >
@@ -136,11 +166,8 @@ export const Header: React.FC<HeaderProps> = ({
               <div className="text-[10px] text-slate-400 font-medium leading-none">
                 رأس المال: <span className="font-mono text-white font-bold">${stats.balance.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}</span>
               </div>
-              <div className="text-[10px] font-bold mt-0.5 flex items-center gap-1">
-                <span className={`w-1.5 h-1.5 rounded-full ${isLive ? 'bg-rose-400 animate-pulse' : 'bg-emerald-400'}`} />
-                <span className={isLive ? 'text-rose-300' : 'text-emerald-400'}>
-                  {isLive ? 'وضع حقيقي (Live)' : 'وضع وهمي (Paper)'}
-                </span>
+              <div className="text-[10px] text-slate-400 mt-0.5 font-mono">
+                {isLive ? 'حساب حقيقي' : 'محفظة تجريبية'}
               </div>
             </div>
           </button>
@@ -263,15 +290,6 @@ export const Header: React.FC<HeaderProps> = ({
                   <span>تشغيل البوت</span>
                 </>
               )}
-            </button>
-
-            {/* Scenarios Button */}
-            <button
-              onClick={onOpenScenarios}
-              className="hidden sm:flex items-center gap-1.5 bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white text-xs font-medium px-3 py-1.5 rounded-lg shadow-sm transition"
-            >
-              <Zap className="w-3.5 h-3.5 text-amber-300 fill-amber-300" />
-              <span>السيناريوهات</span>
             </button>
           </div>
         </div>

@@ -29,7 +29,6 @@ interface DecisionLogTabProps {
   patterns?: PatternStats[];
   minOccurrences?: number;
   onViewDecision: (decision: DecisionLog) => void;
-  onOpenScenarios: () => void;
   onUpdatePatternRepetition?: (tag: string, coin: string, newOccurrences: number, newConfidence?: number) => void;
   onUpdateMinOccurrences?: (newMin: number) => void;
 }
@@ -39,7 +38,6 @@ export const DecisionLogTab: React.FC<DecisionLogTabProps> = ({
   patterns = [],
   minOccurrences = 20,
   onViewDecision,
-  onOpenScenarios,
   onUpdatePatternRepetition,
   onUpdateMinOccurrences,
 }) => {
@@ -132,15 +130,6 @@ export const DecisionLogTab: React.FC<DecisionLogTabProps> = ({
             <p className="text-xs text-slate-400 mt-1 max-w-2xl leading-relaxed">
               <strong>المبدأ الخامس: الشفافية أساس الثقة.</strong> البوت لا يشتري لمجرد مؤشر لحظي، بل يشرح خطوة بخطوة: لماذا هذا النمط؟ كم تكرر؟ كم إطار يدعمه؟ وما سبب القبول أو الرفض أو الانتظار؟
             </p>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              onClick={onOpenScenarios}
-              className="px-3 py-1.5 text-xs font-semibold text-white bg-slate-800 hover:bg-slate-750 border border-slate-700 rounded-lg transition"
-            >
-              عرض أمثلة السيناريوهات (1-5)
-            </button>
           </div>
         </div>
 

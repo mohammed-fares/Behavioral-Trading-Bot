@@ -1,16 +1,74 @@
 import express from "express";
+import http from "http";
 import path from "path";
+import fs from "fs";
 import crypto from "crypto";
+import { WebSocketServer, WebSocket } from "ws";
 import { createServer as createViteServer } from "vite";
 
 const app = express();
+const server = http.createServer(app);
 const PORT = 3000;
 
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 // Helper to sign Binance requests
 function signBinanceQuery(queryString: string, apiSecret: string): string {
   return crypto.createHmac("sha256", apiSecret).update(queryString).digest("hex");
+}
+
+// ----------------------------------------------------
+// Memory File Storage (Phase 5)
+// ----------------------------------------------------
+const MEMORY_FILE = path.join(process.cwd(), "data", "memory.json");
+
+function readMemory() {
+  try {
+    if (fs.existsSync(MEMORY_FILE)) {
+      const raw = fs.readFileSync(MEMORY_FILE, "utf-8");
+      return JSON.parse(raw);
+    }
+  } catch (err) {
+    console.error("Failed to read memory file:", err);
+  }
+  return {
+    patterns: [],
+    swings: [],
+    trades: [],
+    closedTrades: [],
+    activeTrades: [],
+    decisions: [],
+    hourlyReports: [],
+    disqualifiedPatterns: [],
+    stats: {
+      balance: 100,
+      initialBalance: 100,
+      equity: 100,
+      realizedPnL: 0,
+      winCount: 0,
+      lossCount: 0,
+      totalTrades: 0,
+      winRate: 0,
+      profitFactor: 0,
+      maxDrawdownPct: 0,
+      consecutiveLosses: 0,
+      todayLossUsd: 0
+    }
+  };
+}
+
+function writeMemory(data: any): boolean {
+  try {
+    const dir = path.dirname(MEMORY_FILE);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), "utf-8");
+    return true;
+  } catch (err) {
+    console.error("Failed to write memory file:", err);
+    return false;
+  }
 }
 
 // 1. Health & Server Sync Endpoint
@@ -26,6 +84,8 @@ app.get("/api/health", (req, res) => {
     uptimeSeconds: Math.floor(process.uptime()),
     features: {
       marketDataLayer: true,
+      webSocketServer: true,
+      memoryPersistence: true,
       riskEngine: true,
       orderManager: true,
       reconciliation: true,
@@ -34,7 +94,36 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-// 2. Binance Public Tickers Proxy (CORS & Rate limit protection)
+// 2. Memory Persistence Endpoints (Phase 5)
+app.get("/api/memory", (req, res) => {
+  const memory = readMemory();
+  res.json({ success: true, data: memory });
+});
+
+app.post("/api/memory", (req, res) => {
+  try {
+    const body = req.body;
+    let current = readMemory();
+
+    if (body.key && body.value !== undefined) {
+      current[body.key] = body.value;
+    } else if (body.data && typeof body.data === "object") {
+      current = { ...current, ...body.data };
+    } else if (typeof body === "object") {
+      current = { ...current, ...body };
+    }
+
+    const ok = writeMemory(current);
+    if (!ok) {
+      return res.status(500).json({ success: false, error: "Failed to persist memory to disk" });
+    }
+    res.json({ success: true, timestamp: Date.now() });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || "Failed to update memory" });
+  }
+});
+
+// 3. Binance Public Tickers Proxy (CORS & Rate limit protection)
 app.get("/api/binance/tickers", async (req, res) => {
   try {
     const marketType = (req.query.marketType as string) || "USDT_M_FUTURES";
@@ -53,7 +142,7 @@ app.get("/api/binance/tickers", async (req, res) => {
   }
 });
 
-// 3. Binance Klines Proxy
+// 4. Binance Klines Proxy
 app.get("/api/binance/klines", async (req, res) => {
   try {
     const symbol = (req.query.symbol as string) || "BTCUSDT";
@@ -76,7 +165,7 @@ app.get("/api/binance/klines", async (req, res) => {
   }
 });
 
-// 4. Live Order Execution Proxy (Secure Server-Side signing)
+// 5. Live Order Execution Proxy (Secure Server-Side signing)
 app.post("/api/binance/order", async (req, res) => {
   const apiKey = process.env.BINANCE_API_KEY;
   const apiSecret = process.env.BINANCE_API_SECRET;
@@ -138,13 +227,12 @@ app.post("/api/binance/order", async (req, res) => {
   }
 });
 
-// 5. Positions & Account Proxy
+// 6. Positions & Account Proxy
 app.get("/api/binance/positions", async (req, res) => {
   const apiKey = process.env.BINANCE_API_KEY;
   const apiSecret = process.env.BINANCE_API_SECRET;
 
   if (!apiKey || !apiSecret) {
-    // Return empty list if keys are not set, not an error
     return res.json({ success: true, positions: [], configured: false });
   }
 
@@ -170,6 +258,109 @@ app.get("/api/binance/positions", async (req, res) => {
   }
 });
 
+// ----------------------------------------------------
+// WebSocket Server for Real-Time Streaming (Phase 3)
+// ----------------------------------------------------
+const wss = new WebSocketServer({ server, path: "/ws/market" });
+
+const activeSymbols = new Set([
+  'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 
+  'ADAUSDT', 'XRPUSDT', 'DOGEUSDT', 'AVAXUSDT'
+]);
+
+let binanceWs: WebSocket | null = null;
+let reconnectTimer: any = null;
+
+function connectBinanceWs() {
+  if (binanceWs) {
+    try { binanceWs.terminate(); } catch (_) {}
+    binanceWs = null;
+  }
+
+  try {
+    binanceWs = new WebSocket("wss://fstream.binance.com/ws/!ticker@arr");
+
+    binanceWs.on("open", () => {
+      console.log("[WebSocket] Upstream Binance stream connected");
+    });
+
+    binanceWs.on("message", (raw) => {
+      try {
+        const data = JSON.parse(raw.toString());
+        if (Array.isArray(data)) {
+          const filtered = data
+            .filter((t: any) => activeSymbols.has(t.s))
+            .map((t: any) => ({
+              symbol: t.s,
+              lastPrice: parseFloat(t.c || "0"),
+              bid: parseFloat(t.b || "0"),
+              ask: parseFloat(t.a || "0"),
+              high24h: parseFloat(t.h || "0"),
+              low24h: parseFloat(t.l || "0"),
+              volume24h: parseFloat(t.q || "0"),
+              change24h: parseFloat(t.P || "0"),
+              timestamp: t.E || Date.now()
+            }));
+
+          if (filtered.length > 0) {
+            const messageStr = JSON.stringify({
+              type: "TICKERS_UPDATE",
+              tickers: filtered,
+              timestamp: Date.now()
+            });
+
+            wss.clients.forEach((client) => {
+              if (client.readyState === WebSocket.OPEN) {
+                client.send(messageStr);
+              }
+            });
+          }
+        }
+      } catch (_) {
+        // ignore parse glitch
+      }
+    });
+
+    binanceWs.on("close", () => {
+      console.log("[WebSocket] Binance stream disconnected, reconnecting in 3s...");
+      clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(connectBinanceWs, 3000);
+    });
+
+    binanceWs.on("error", (err) => {
+      console.warn("[WebSocket] Binance stream error:", err.message);
+      try { binanceWs?.close(); } catch (_) {}
+    });
+  } catch (err: any) {
+    console.warn("[WebSocket] Binance connection error:", err?.message || err);
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(connectBinanceWs, 5000);
+  }
+}
+
+connectBinanceWs();
+
+wss.on("connection", (ws) => {
+  ws.send(JSON.stringify({ 
+    type: "WELCOME", 
+    message: "Behavioral Trading Bot Real-Time Stream Connected", 
+    timestamp: Date.now() 
+  }));
+
+  ws.on("message", (msg) => {
+    try {
+      const parsed = JSON.parse(msg.toString());
+      if (parsed.type === "PING") {
+        ws.send(JSON.stringify({ type: "PONG", timestamp: Date.now() }));
+      } else if (parsed.type === "SUBSCRIBE" && parsed.symbols) {
+        if (Array.isArray(parsed.symbols)) {
+          parsed.symbols.forEach((s: string) => activeSymbols.add(s.toUpperCase()));
+        }
+      }
+    } catch (_) {}
+  });
+});
+
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -185,7 +376,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  server.listen(PORT, "0.0.0.0", () => {
     console.log(`Behavioral Bot server running on http://0.0.0.0:${PORT}`);
   });
 }

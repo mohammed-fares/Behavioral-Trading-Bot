@@ -25,114 +25,36 @@ import {
 import { TechnicalRSI } from './math/rsi';
 import { TechnicalADX } from './math/adx';
 import { PatternSimilarity } from './learning/similarity';
-import { ProbabilityCalibration } from './learning/calibration';
+import { ProbabilityCalibration, wilsonScore } from './learning/calibration';
 import { FinancialMath } from './math/financial';
+import { detectMarketRegime } from './learning/regime';
+import { getSymbolPerformance } from './marketData/marketDataLayer';
+import { evaluateTradeManagement } from './behavior/tradeManagement';
+import { learnFromClosedTrade } from './behavior/bayesianLearning';
+import { 
+  calculateRSI, 
+  calculateADX, 
+  hasVolumeConfirmation,
+  detectSwingAndPattern, 
+  findPatternStats 
+} from './behavior/patternDetection';
 
 export const BehaviorEngine = {
   /**
    * حساب المؤشرات الفنية الأساسية (RSI و ADX) باستخدام المعايير القياسية
    */
-  calculateRSI(closes: number[], period: number = 14): number {
-    return TechnicalRSI.calculate(closes, period);
-  },
-
-  calculateADX(candles: Candle[], period: number = 14): number {
-    return TechnicalADX.calculate(candles, period).adx;
-  },
+  calculateRSI,
+  calculateADX,
 
   /**
    * كشف التذبذب الأخير وصياغة بصمة النمط (Pattern Tag)
-   * الشكل: P-{Dir}-{Mag}-{Dur}-R{rsi1}-{rsi2}-A{adx1}-{adx2}
    */
-  detectSwingAndPattern(
-    coin: string, 
-    timeframe: Timeframe, 
-    candles: Candle[],
-    minMovementPct: number = 0.5
-  ): { swing: Swing; patternTag: string } | null {
-    if (candles.length < 15) return null;
-
-    // Look at recent swing window (last 10 to 30 candles)
-    const lookback = Math.min(25, candles.length - 2);
-    const window = candles.slice(-lookback);
-    const startCandle = window[0];
-    const endCandle = window[window.length - 1];
-
-    const changePct = Number((((endCandle.close - startCandle.open) / startCandle.open) * 100).toFixed(1));
-    const absChange = Math.abs(changePct);
-    
-    let direction: Direction = 'SIDEWAYS';
-    if (absChange >= minMovementPct) {
-      direction = changePct > 0 ? 'UP' : 'DOWN';
-    } else {
-      direction = 'SIDEWAYS';
-    }
-
-    // Time calculation
-    const tfInfo = TIMEFRAMES.find(t => t.id === timeframe);
-    const stepMins = tfInfo ? tfInfo.minutes : 15;
-    const durationMinutes = window.length * stepMins;
-
-    // RSI calculation start vs end
-    const closesEarly = candles.slice(0, candles.length - Math.floor(window.length / 2)).map(c => c.close);
-    const closesLate = candles.map(c => c.close);
-    const rsiStart = this.calculateRSI(closesEarly);
-    const rsiEnd = this.calculateRSI(closesLate);
-
-    // ADX calculation
-    const adxStart = Math.max(15, this.calculateADX(candles.slice(0, -5)));
-    const adxEnd = Math.max(18, this.calculateADX(candles));
-
-    const dirLetter = direction === 'UP' ? 'U' : direction === 'DOWN' ? 'D' : 'S';
-    const patternTag = `P-${dirLetter}-${absChange}-${durationMinutes}-R${rsiStart}-${rsiEnd}-A${adxStart}-${adxEnd}`;
-
-    const swing: Swing = {
-      id: `sw-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      coin,
-      timeframe,
-      startTime: startCandle.timestamp,
-      endTime: endCandle.timestamp,
-      direction,
-      startPrice: startCandle.open,
-      endPrice: endCandle.close,
-      magnitudePct: absChange,
-      durationMinutes,
-      rsiStart,
-      rsiEnd,
-      adxStart,
-      adxEnd,
-      patternTag,
-    };
-
-    return { swing, patternTag };
-  },
+  detectSwingAndPattern,
 
   /**
    * البحث في الذاكرة ومطابقة النمط (Memory Search)
    */
-  findPatternStats(patternTag: string, memoryPatterns: PatternStats[]): PatternStats | null {
-    // 1. Exact match
-    const exact = memoryPatterns.find(p => p.tag === patternTag);
-    if (exact) return exact;
-
-    // 2. Fuzzy match by Direction + Magnitude range (within 0.4%) + RSI bucket
-    const parts = patternTag.split('-');
-    if (parts.length >= 6) {
-      const dir = parts[1];
-      const mag = parseFloat(parts[2]);
-      const similar = memoryPatterns.find(p => {
-        const pParts = p.tag.split('-');
-        if (pParts.length >= 6 && pParts[1] === dir) {
-          const pMag = parseFloat(pParts[2]);
-          return Math.abs(pMag - mag) <= 0.4;
-        }
-        return false;
-      });
-      if (similar) return similar;
-    }
-
-    return null;
-  },
+  findPatternStats,
 
   /**
    * فحص توافق الأطر السبعة (Timeframe Alignment)
@@ -150,11 +72,23 @@ export const BehaviorEngine = {
     let neutralCount = 0;
     let netAdjustment = 0;
 
+    // Institutional multi-timeframe weights: Macro frames govern overall trend bias
+    const TF_WEIGHTS: Record<Timeframe, number> = {
+      '1d': 10,
+      '4h': 8,
+      '1h': 6,
+      '30m': 5,
+      '15m': 4,
+      '5m': 3,
+      '1m': 2,
+    };
+
     for (const tf of TIMEFRAMES) {
       const signal = allTimeframeSignals.find(s => s.timeframe === tf.id);
       const tfDir = signal ? signal.direction : 'SIDEWAYS';
       const tfConf = signal ? signal.confidence : 50;
       const tag = signal ? signal.patternTag : 'P-NEUTRAL';
+      const tfWeight = TF_WEIGHTS[tf.id] || 4;
 
       let isSupporting = false;
       let isOpposing = false;
@@ -167,13 +101,12 @@ export const BehaviorEngine = {
       } else if (tfDir === baseDirection && tfDir !== 'SIDEWAYS') {
         isSupporting = true;
         supportingCount++;
-        // Higher weight for 5m, 1h, 4h
-        if (tf.id === '5m' || tf.id === '1h') contributionPct = 10;
-        else contributionPct = 5;
+        contributionPct = tfWeight;
       } else if (tfDir !== 'SIDEWAYS' && tfDir !== baseDirection) {
         isOpposing = true;
         opposingCount++;
-        contributionPct = -10;
+        // Opposing higher timeframes carries a stronger directional penalty
+        contributionPct = -Math.round(tfWeight * 1.5);
       } else {
         isNeutral = true;
         neutralCount++;
@@ -194,7 +127,19 @@ export const BehaviorEngine = {
     }
 
     const adjustedConfidence = Math.max(10, Math.min(98, baseConfidence + netAdjustment));
-    const isAligned = supportingCount >= 4 && opposingCount < 3;
+    
+    // Condition: 1h and 4h must agree on direction if both are directional
+    const h1Signal = signals.find(s => s.timeframe === '1h');
+    const h4Signal = signals.find(s => s.timeframe === '4h');
+    const h1H4Conflict = !!(
+      h1Signal && 
+      h4Signal && 
+      h1Signal.direction !== 'SIDEWAYS' && 
+      h4Signal.direction !== 'SIDEWAYS' && 
+      h1Signal.direction !== h4Signal.direction
+    );
+
+    const isAligned = (supportingCount + 1) >= 5 && opposingCount <= 2 && !h1H4Conflict && adjustedConfidence >= 70;
 
     return {
       coin,
@@ -227,46 +172,118 @@ export const BehaviorEngine = {
     stats: UserStats,
     disqualifiedPatterns: DisqualifiedPattern[] = [],
     dataSource: DataSource = 'REAL_MARKET',
-    currentRegime: MarketRegime = 'RANGE'
+    currentRegime: MarketRegime = 'RANGE',
+    candles?: Candle[],
+    bidAsk?: { bid: number; ask: number }
   ): DecisionLog {
     const now = Date.now();
     const currentUtcHour = new Date(now).getUTCHours();
     const reasons: string[] = [];
     const reviewSteps: DecisionStepReview[] = [];
 
-    // Step 1: Pattern Criteria & Multi-Dimensional Similarity Review
+    // Filter 1: Volume Confirmation
+    let volumePassed = true;
+    if (candles && candles.length >= 20) {
+      volumePassed = hasVolumeConfirmation(candles, 1.5);
+      reviewSteps.push({
+        name: 'فحص تأكيد الحجم (Volume Confirmation)',
+        passed: volumePassed,
+        detail: volumePassed 
+          ? 'حجم الشمعة الأخيرة أعلى من 1.5x متوسط الـ 20 شمعة السابقة'
+          : 'حجم الشمعة الأخيرة أقل من 1.5x متوسط الـ 20 شمعة السابقة (NO_VOLUME_CONFIRMATION)',
+        threshold: '> 1.5x المتوسط'
+      });
+      if (!volumePassed) reasons.push('عدم وجود تأكيد كافٍ من حجم التداول (NO_VOLUME_CONFIRMATION)');
+    }
+
+    // Filter 2: RSI Zone [40, 70]
+    let rsiPassed = true;
+    if (candles && candles.length >= 15) {
+      const currentRSI = TechnicalRSI.calculate(candles.map(c => c.close), 14);
+      rsiPassed = currentRSI >= 40 && currentRSI <= 70;
+      reviewSteps.push({
+        name: 'نطاق مؤشر RSI (40 - 70)',
+        passed: rsiPassed,
+        detail: rsiPassed 
+          ? `مؤشر RSI (${currentRSI}) داخل النطاق المتوازن [40 - 70]` 
+          : `مؤشر RSI (${currentRSI}) خارج النطاق المقبول [40 - 70] (RSI_OUT_OF_ZONE)`,
+        metric: `${currentRSI}`,
+        threshold: '40 <= RSI <= 70'
+      });
+      if (!rsiPassed) reasons.push(`مؤشر RSI (${currentRSI}) خارج النطاق الفني الآمن (RSI_OUT_OF_ZONE)`);
+    }
+
+    // Filter 3: ADX Strength (ADX >= 25)
+    let adxPassed = true;
+    if (candles && candles.length >= 28) {
+      const currentADX = TechnicalADX.calculate(candles, 14);
+      adxPassed = currentADX.adx >= 25;
+      reviewSteps.push({
+        name: 'قوة الزخم الفني (ADX >= 25)',
+        passed: adxPassed,
+        detail: adxPassed 
+          ? `مؤشر ADX (${currentADX.adx}) يعكس اتجاهاً قوياً` 
+          : `مؤشر ADX (${currentADX.adx}) ضعيف جداً أقل من 25 (ADX_TOO_WEAK)`,
+        metric: `${currentADX.adx}`,
+        threshold: 'ADX >= 25'
+      });
+      if (!adxPassed) reasons.push(`قوة الاتجاه غير كافية ADX=${currentADX.adx} < 25 (ADX_TOO_WEAK)`);
+    }
+
+    // Filter 4: Spread Check (Spread <= 0.05%)
+    let spreadPassed = true;
+    if (bidAsk && bidAsk.bid > 0) {
+      const spreadPct = ((bidAsk.ask - bidAsk.bid) / bidAsk.bid) * 100;
+      spreadPassed = spreadPct <= 0.05;
+      reviewSteps.push({
+        name: 'فحص الفارق السعري (Spread Check)',
+        passed: spreadPassed,
+        detail: spreadPassed 
+          ? `الفارق السعري ${spreadPct.toFixed(3)}% ضمن الحدود المسموحة (<= 0.05%)`
+          : `الفارق السعري ${spreadPct.toFixed(3)}% مرتفع جداً (SPREAD_TOO_WIDE)`,
+        metric: `${spreadPct.toFixed(3)}%`,
+        threshold: '<= 0.05%'
+      });
+      if (!spreadPassed) reasons.push(`الفارق السعري كبير جداً (${spreadPct.toFixed(3)}% > 0.05%) (SPREAD_TOO_WIDE)`);
+    }
+
+    const technicalFiltersPassed = volumePassed && rsiPassed && adxPassed && spreadPassed;
+
+    // Step 1: Pattern Criteria & Multi-Dimensional Similarity Review with Wilson Score
     let patternPassed = false;
     let initialConfidence = 50;
     let similarity = pattern ? PatternSimilarity.calculateSimilarity(patternTag, pattern, currentRegime) : undefined;
 
     if (pattern) {
-      initialConfidence = pattern.confidence || Math.round(pattern.continuationRate);
+      const wins = pattern.continuedCount || Math.round(((pattern.confidence || 50) / 100) * pattern.occurrences);
+      const wilsonConf = Math.round(wilsonScore(wins, pattern.occurrences, 0.95));
+      initialConfidence = wilsonConf > 0 ? wilsonConf : (pattern.confidence || Math.round(pattern.continuationRate));
       const occPassed = pattern.occurrences >= settings.minOccurrences;
       const confPassed = initialConfidence >= settings.minConfidence;
-      const simPassed = !similarity || similarity.score >= (settings.minSimilarityPct || 75);
+      const simPassed = !similarity || similarity.score >= (settings.minSimilarityPct || 80);
       patternPassed = occPassed && confPassed && simPassed;
 
       reviewSteps.push({
-        name: 'فحص النمط وتكراره التاريخي',
+        name: 'فحص النمط ومؤشر ويلسون الإحصائي (Wilson Score)',
         passed: occPassed && confPassed,
-        detail: `تكرر ${pattern.occurrences} مرة (المطلوب ≥ ${settings.minOccurrences}) | الثقة الأولية: ${initialConfidence}% (المطلوب ≥ ${settings.minConfidence}%)`,
-        metric: `${pattern.occurrences} تكرار`,
-        threshold: `≥ ${settings.minOccurrences}`,
+        detail: `تكرر ${pattern.occurrences} مرة (المطلوب ≥ ${settings.minOccurrences}) | ثقة ويلسون الإحصائية: ${initialConfidence}% (المطلوب ≥ ${settings.minConfidence}%)`,
+        metric: `${initialConfidence}% Wilson`,
+        threshold: `≥ ${settings.minConfidence}%`,
       });
 
       if (similarity) {
         reviewSteps.push({
           name: 'المطابقة السلوكية المتعددة الأبعاد (Pattern Similarity)',
           passed: simPassed,
-          detail: `درجة التشابه: ${similarity.score}% (المطلوب ≥ ${settings.minSimilarityPct || 75}%) | تطابق النظام: ${similarity.regimeMatch ? 'نعم' : 'لا'}`,
+          detail: `درجة التشابه: ${similarity.score}% (المطلوب ≥ ${settings.minSimilarityPct || 80}%) | تطابق النظام: ${similarity.regimeMatch ? 'نعم' : 'لا'}`,
           metric: `${similarity.score}%`,
-          threshold: `≥ ${settings.minSimilarityPct || 75}%`
+          threshold: `≥ ${settings.minSimilarityPct || 80}%`
         });
-        if (!simPassed) reasons.push(`درجة تشابه النمط (${similarity.score}%) أقل من الحد الأدنى (${settings.minSimilarityPct || 75}%)`);
+        if (!simPassed) reasons.push(`درجة تشابه النمط (${similarity.score}%) أقل من الحد الأدنى (${settings.minSimilarityPct || 80}%)`);
       }
 
       if (!occPassed) reasons.push(`عدد التكرارات في الذاكرة (${pattern.occurrences}) أقل من الحد الأدنى (${settings.minOccurrences})`);
-      if (!confPassed) reasons.push(`الثقة الأولية (${initialConfidence}%) أقل من الحد الأدنى (${settings.minConfidence}%)`);
+      if (!confPassed) reasons.push(`ثقة ويلسون الإحصائية (${initialConfidence}%) أقل من الحد الأدنى (${settings.minConfidence}%)`);
     } else {
       reviewSteps.push({
         name: 'فحص النمط في الذاكرة',
@@ -276,6 +293,47 @@ export const BehaviorEngine = {
       });
       reasons.push('نمط جديد تماماً يحتاج لبناء ذاكرة تاريخية قبل التداول');
     }
+
+    // Step 1.2: Market Regime Detection & Filtering
+    let regimePassed = true;
+    let regimeSizeMultiplier = 1.0;
+    if (candles && candles.length >= 20) {
+      const regime = detectMarketRegime(candles);
+      if (regime === 'RANGING') {
+        regimePassed = false;
+        reasons.push('نظام السوق عرضي (RANGING) - منع فتح صفقات اتجاهية');
+      } else if (regime === 'VOLATILE') {
+        regimeSizeMultiplier = 0.5;
+        reasons.push('نظام السوق عالي التقلب (VOLATILE) - خفض حجم الصفقة 50%');
+      }
+      reviewSteps.push({
+        name: 'كشف نظام السوق (Market Regime)',
+        passed: regimePassed,
+        detail: `نظام السوق المكتشف: ${regime} | مضاعف الحجم: ${regimeSizeMultiplier}x`,
+        threshold: 'TRENDING / VOLATILE'
+      });
+    }
+
+    // Step 1.3: Smart Symbol Performance Selection
+    let symbolPerfPassed = true;
+    const symbolPerf = getSymbolPerformance(coin, closedTrades, candles);
+    if (symbolPerf.totalTrades > 10 && symbolPerf.sharpe < 0.5) {
+      symbolPerfPassed = false;
+      reasons.push(`أداء العملة ضعيف تاريخياً (Sharpe = ${symbolPerf.sharpe} < 0.5) (POOR_SYMBOL_PERFORMANCE)`);
+    }
+    if (symbolPerf.volatility < 1.0) {
+      symbolPerfPassed = false;
+      reasons.push(`تقلب العملة منخفض (${symbolPerf.volatility}% < 1.0%) (LOW_VOLATILITY)`);
+    } else if (symbolPerf.volatility > 5.0) {
+      symbolPerfPassed = false;
+      reasons.push(`تقلب العملة مفرط (${symbolPerf.volatility}% > 5.0%) (EXTREME_VOLATILITY)`);
+    }
+    reviewSteps.push({
+      name: 'فحص أداء وتقلب العملة (Symbol Selection)',
+      passed: symbolPerfPassed,
+      detail: `نسبة شارب: ${symbolPerf.sharpe} | معدل التقلب: ${symbolPerf.volatility}% | الصفقات السابقة: ${symbolPerf.totalTrades}`,
+      threshold: 'Sharpe >= 0.5 & Volatility [1.0% - 5.0%]'
+    });
 
     // Step 1.5: Anti-Repetition Rule (منع تكرار الأخطاء والاستراتيجيات الخاسرة)
     let antiRepetitionPassed = true;
@@ -380,19 +438,21 @@ export const BehaviorEngine = {
     const dailyLimitPassed = Math.abs(stats.todayLossUsd) < (stats.initialBalance * (settings.dailyLossLimitPct / 100));
     const consecLossesPassed = stats.consecutiveLosses < settings.maxConsecutiveLosses;
     
-    // Check 30-min cooldown for this coin
+    // Check cooldown for this coin using configured settings.cooldownMinutes
+    const cooldownMins = settings.cooldownMinutes ?? 15;
+    const cooldownMs = cooldownMins * 60 * 1000;
     const lastCoinTrade = closedTrades.filter(t => t.coin === coin).sort((a, b) => (b.exitTime || 0) - (a.exitTime || 0))[0];
-    const isCooldown = lastCoinTrade && lastCoinTrade.exitTime && (now - lastCoinTrade.exitTime < 30 * 60 * 1000);
+    const isCooldown = !!(lastCoinTrade && lastCoinTrade.exitTime && (now - lastCoinTrade.exitTime < cooldownMs));
 
     const riskPassed = dailyLimitPassed && consecLossesPassed && !isCooldown;
     reviewSteps.push({
       name: 'إدارة المخاطر والـ Cooldown',
       passed: riskPassed,
       detail: isCooldown 
-        ? `العملة في فترة Cooldown (أقل من 30 دقيقة من آخر صفقة)`
+        ? `العملة في فترة Cooldown (أقل من ${cooldownMins} دقيقة من آخر صفقة)`
         : `الخسائر المتتالية: ${stats.consecutiveLosses}/${settings.maxConsecutiveLosses} | الخسارة اليومية ضمن الحد`,
     });
-    if (isCooldown) reasons.push(`العملة في فترة راحة Cooldown مؤقتة`);
+    if (isCooldown) reasons.push(`العملة في فترة راحة Cooldown مؤقتة (${cooldownMins} دقيقة)`);
     if (!dailyLimitPassed) reasons.push(`تم الوصول للحد الأقصى للخسارة اليومية (${settings.dailyLossLimitPct}%)`);
     if (!consecLossesPassed) reasons.push(`تم الوصول للحد الأقصى للخسائر المتتالية (${settings.maxConsecutiveLosses})`);
 
@@ -402,7 +462,7 @@ export const BehaviorEngine = {
     // Decision Status Determination
     let status: 'APPROVED' | 'REJECTED' | 'WAIT' = 'REJECTED';
 
-    if (patternPassed && alignmentPassed && hourPassed && tradesPassed && riskPassed && antiRepetitionPassed && finalConfidence >= settings.minConfidence) {
+    if (patternPassed && alignmentPassed && hourPassed && tradesPassed && riskPassed && antiRepetitionPassed && technicalFiltersPassed && regimePassed && symbolPerfPassed && finalConfidence >= settings.minConfidence) {
       status = 'APPROVED';
       reasons.unshift(`المعايير مكتملة بنجاح: ثقة نهائية ${finalConfidence}% مع توافق ${alignment.supportingCount}/7 أطر`);
     } else if (!antiRepetitionPassed) {
@@ -426,7 +486,7 @@ export const BehaviorEngine = {
 
       const maxPerTradeUsd = (stats.balance * (settings.positionSizePct / 100)) * settings.leverage;
       const alignmentFactor = alignment.supportingCount / 7;
-      const sizeUsd = Math.round((finalConfidence / 100) * maxPerTradeUsd * alignmentFactor * 1.2);
+      const sizeUsd = Math.round((finalConfidence / 100) * maxPerTradeUsd * alignmentFactor * 1.2 * regimeSizeMultiplier);
 
       const isLong = alignment.finalDirection === 'UP';
       const targetPrice = isLong 
@@ -479,144 +539,10 @@ export const BehaviorEngine = {
   /**
    * إدارة الصفقة الذكية (Phase 6: Management & Smart Exit)
    */
-  evaluateTradeManagement(
-    trade: Trade,
-    currentPrice: number,
-    settings: StrategySettings
-  ): { updatedTrade: Trade; shouldClose: boolean; reason?: string } {
-    const isLong = trade.direction === 'LONG';
-    const qty = trade.quantity || (trade.sizeUsd / trade.entryPrice);
-    const grossPnLUsd = FinancialMath.calcPnL(trade.direction, trade.entryPrice, currentPrice, qty);
-    const feesPaid = trade.feesPaidUsd || 0;
-    const currentPnLUsd = FinancialMath.round(grossPnLUsd - feesPaid, 2);
-    const currentPnLPct = FinancialMath.calcReturnPct(currentPnLUsd, trade.marginUsd || (trade.sizeUsd / trade.leverage));
-    
-    const peakPrice = isLong ? Math.max(trade.peakPrice, currentPrice) : Math.min(trade.peakPrice, currentPrice);
-    const peakPnLPct = Math.max(trade.peakPnLPct, currentPnLPct);
-
-    const now = Date.now();
-    const durationMinutes = Math.round((now - trade.entryTime) / 60000);
-
-    // Smart Exit Check:
-    // When profit reaches 50% of target, activate trailing stop
-    const targetThresholdPct = trade.targetPct * (settings.smartExitThresholdPct / 100);
-    const isTrailingActive = trade.isTrailingActive || peakPnLPct >= targetThresholdPct;
-
-    let trailingStopPrice = trade.trailingStopPrice;
-    if (isTrailingActive && !trailingStopPrice) {
-      trailingStopPrice = trade.entryPrice;
-    }
-
-    let shouldClose = false;
-    let exitReason: 'TAKE_PROFIT' | 'STOP_LOSS' | 'SMART_EXIT' | 'TIMEOUT' | undefined = undefined;
-
-    // 1. Take Profit hit
-    if (currentPnLPct >= trade.targetPct) {
-      shouldClose = true;
-      exitReason = 'TAKE_PROFIT';
-    }
-    // 2. Stop Loss hit
-    else if (currentPnLPct <= -trade.stopLossPct) {
-      shouldClose = true;
-      exitReason = 'STOP_LOSS';
-    }
-    // 3. Smart Exit: Retracement >= 25% from peak after hitting trailing threshold
-    else if (isTrailingActive && peakPnLPct > 0.5) {
-      const pullbackPct = ((peakPnLPct - currentPnLPct) / peakPnLPct) * 100;
-      if (pullbackPct >= settings.smartExitRetracementPct) {
-        shouldClose = true;
-        exitReason = 'SMART_EXIT';
-      }
-    }
-    // 4. Timeout: exceeded expected duration * 1.6
-    else if (durationMinutes > trade.expectedDurationMinutes * 1.6 && currentPnLPct > 0.2) {
-      shouldClose = true;
-      exitReason = 'TIMEOUT';
-    }
-
-    const updatedTrade: Trade = {
-      ...trade,
-      currentPrice,
-      peakPrice,
-      peakPnLPct,
-      currentPnLUsd,
-      currentPnLPct,
-      isTrailingActive,
-      trailingStopPrice,
-      durationMinutes,
-      status: shouldClose ? 'CLOSED' : 'OPEN',
-      exitPrice: shouldClose ? currentPrice : undefined,
-      exitTime: shouldClose ? now : undefined,
-      exitReason: shouldClose ? exitReason : undefined,
-      realizedPnLUsd: shouldClose ? currentPnLUsd : undefined,
-      realizedPnLPct: shouldClose ? currentPnLPct : undefined,
-    };
-
-    return {
-      updatedTrade,
-      shouldClose,
-      reason: exitReason,
-    };
-  },
+  evaluateTradeManagement: evaluateTradeManagement,
 
   /**
    * التعلم المستمر بعد إغلاق الصفقة (Phase 7: Learning)
    */
-  learnFromClosedTrade(
-    closedTrade: Trade,
-    patterns: PatternStats[]
-  ): { updatedPatterns: PatternStats[]; learnedLesson: string } {
-    const isWin = (closedTrade.realizedPnLUsd || 0) > 0;
-    const currentHour = new Date(closedTrade.entryTime).getUTCHours();
-    let learnedLesson = '';
-
-    const updatedPatterns = patterns.map(p => {
-      if (p.tag === closedTrade.patternTag && p.coin === closedTrade.coin) {
-        const newOcc = p.occurrences + 1;
-        const newCont = isWin ? p.continuedCount + 1 : p.continuedCount;
-        const newRev = !isWin ? p.reversedCount + 1 : p.reversedCount;
-        const newContRate = Number(((newCont / newOcc) * 100).toFixed(1));
-        const newRevRate = Number(((newRev / newOcc) * 100).toFixed(1));
-        const newConf = isWin ? Math.min(95, p.confidence + 1) : Math.max(20, p.confidence - 1);
-
-        // Update hour stats
-        const currentHourStats = p.bestHours[currentHour] || { count: 0, winRate: 50, avgProfit: 0 };
-        const newHourCount = currentHourStats.count + 1;
-        const newHourWins = isWin ? (currentHourStats.count * (currentHourStats.winRate / 100)) + 1 : (currentHourStats.count * (currentHourStats.winRate / 100));
-        const newHourWinRate = Number(((newHourWins / newHourCount) * 100).toFixed(1));
-
-        return {
-          ...p,
-          occurrences: newOcc,
-          continuedCount: newCont,
-          reversedCount: newRev,
-          continuationRate: newContRate,
-          reversalRate: newRevRate,
-          confidence: newConf,
-          lastOccurredAt: Date.now(),
-          bestHours: {
-            ...p.bestHours,
-            [currentHour]: {
-              count: newHourCount,
-              winRate: newHourWinRate,
-              avgProfit: Number(((currentHourStats.avgProfit + (closedTrade.realizedPnLPct || 0)) / 2).toFixed(2)),
-            },
-          },
-        };
-      }
-      return p;
-    });
-
-    if (isWin) {
-      if (closedTrade.exitReason === 'SMART_EXIT') {
-        learnedLesson = `إغلاق ذكي (Smart Exit): تم حجز أرباح بقيمة +$${closedTrade.realizedPnLUsd} (${closedTrade.realizedPnLPct}%) عند التراجع من القمة (${closedTrade.peakPnLPct}%).`;
-      } else {
-        learnedLesson = `نجاح تام: النمط ${closedTrade.patternTag} حقق الهدف بنسبة +$${closedTrade.realizedPnLUsd} مع توافق ${closedTrade.supportingTimeframesCount}/7 أطر في الساعة ${currentHour}:00 UTC.`;
-      }
-    } else {
-      learnedLesson = `درس مستفاد: خسارة -$${Math.abs(closedTrade.realizedPnLUsd || 0)} في الساعة ${currentHour}:00 UTC. تم خفض ثقة النمط وزيادة اشتراط التوافق الصارم مستقبلاً.`;
-    }
-
-    return { updatedPatterns, learnedLesson };
-  }
+  learnFromClosedTrade: learnFromClosedTrade
 };

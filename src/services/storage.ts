@@ -1,6 +1,7 @@
 /**
- * Storage Service — إدارة الذاكرة المحلية المستمرة في المتصفح
- * بدون الحاجة لخوادم خارجية: كل شيء يُحفظ محلياً في localStorage مع خيار التصدير والاستيراد
+ * Storage Service — إدارة الذاكرة المستمرة عبر السيرفر (Phase 5: Server Memory)
+ * يتم تخزين الذاكرة على السيرفر في data/memory.json عبر REST endpoints (GET/POST /api/memory)
+ * مع كاش محلي فوري واحتياطي في localStorage.
  */
 
 import { 
@@ -13,9 +14,14 @@ import {
   HourlyReport,
   DisqualifiedPattern 
 } from '../types';
+import { createCleanStats, deduplicateById } from './storage/storageReset';
+import { exportMemoryJson, importMemoryJson, deduplicateTrades } from './storage/storageExport';
+import { performCleanSlate, calculateDatabaseStats, CleanSlateOptions } from './storage/storageCleanSlate';
+import { loadHourlyReports, loadDisqualifiedPatterns } from './storage/storageReports';
 import { 
   DEFAULT_SETTINGS, 
   DEFAULT_STATS, 
+  DEFAULT_LIVE_STATS,
   generateSeedPatterns, 
   generateSeedSwings, 
   generateSeedTrades, 
@@ -27,212 +33,331 @@ import {
 const KEYS = {
   PATTERNS: 'behavioral_bot_patterns_v1',
   SWINGS: 'behavioral_bot_swings_v1',
-  TRADES: 'behavioral_bot_trades_v1',
-  DECISIONS: 'behavioral_bot_decisions_v1',
   SETTINGS: 'behavioral_bot_settings_v1',
-  STATS: 'behavioral_bot_stats_v1',
   HOURLY_REPORTS: 'behavioral_bot_hourly_reports_v1',
   DISQUALIFIED: 'behavioral_bot_disqualified_v1',
   LAST_SYNC: 'behavioral_bot_last_sync_v1',
+  CURRENT_MODE: 'behavioral_bot_current_mode_v2',
+  TRADES_PAPER: 'behavioral_bot_trades_paper_v2',
+  TRADES_LIVE: 'behavioral_bot_trades_live_v2',
+  DECISIONS_PAPER: 'behavioral_bot_decisions_paper_v2',
+  DECISIONS_LIVE: 'behavioral_bot_decisions_live_v2',
+  STATS_PAPER: 'behavioral_bot_stats_paper_v2',
+  STATS_LIVE: 'behavioral_bot_stats_live_v2',
+  TRADES_LEGACY: 'behavioral_bot_trades_v1',
+  DECISIONS_LEGACY: 'behavioral_bot_decisions_v1',
+  STATS_LEGACY: 'behavioral_bot_stats_v1',
 };
 
+// In-memory runtime cache
+let memoryCache: Record<string, any> = {
+  patterns: [],
+  swings: [],
+  tradesPaper: [],
+  tradesLive: [],
+  decisionsPaper: [],
+  decisionsLive: [],
+  statsPaper: { ...DEFAULT_STATS },
+  statsLive: { ...DEFAULT_LIVE_STATS },
+  settings: { ...DEFAULT_SETTINGS },
+  hourlyReports: [],
+  disqualifiedPatterns: [],
+  currentMode: 'PAPER'
+};
+
+let syncTimer: any = null;
+let isInitialized = false;
+
+// Async sync to server
+async function persistToServer(key: string, value: any) {
+  try {
+    if (typeof window === 'undefined') return;
+    await fetch('/api/memory', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key, value }),
+    });
+  } catch (err) {
+    // Non-blocking fallback
+    console.warn('[StorageService] Background server sync warning:', err);
+  }
+}
+
+function debounceSyncToServer(payload: Record<string, any>) {
+  clearTimeout(syncTimer);
+  syncTimer = setTimeout(async () => {
+    try {
+      if (typeof window === 'undefined') return;
+      await fetch('/api/memory', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch (_) {}
+  }, 400);
+}
+
 export const StorageService = {
+  /**
+   * Initialize and hydrate memory from server GET /api/memory
+   */
+  async init(): Promise<void> {
+    if (isInitialized) return;
+    try {
+      if (typeof window !== 'undefined') {
+        const res = await fetch('/api/memory');
+        if (res.ok) {
+          const json = await res.json();
+          if (json.success && json.data) {
+            const data = json.data;
+            ['patterns', 'swings', 'tradesPaper', 'tradesLive', 'decisionsPaper', 'decisionsLive', 'statsPaper', 'statsLive', 'hourlyReports', 'disqualifiedPatterns', 'currentMode'].forEach(k => {
+              if (data[k] !== undefined) memoryCache[k] = data[k];
+            });
+            if (data.trades && !data.tradesPaper) memoryCache.tradesPaper = data.trades;
+            if (data.decisions && !data.decisionsPaper) memoryCache.decisionsPaper = data.decisions;
+            if (data.stats && !data.statsPaper) memoryCache.statsPaper = data.stats;
+            if (data.settings) memoryCache.settings = { ...DEFAULT_SETTINGS, ...data.settings };
+            isInitialized = true;
+            return;
+          }
+        }
+      }
+    } catch (e) {
+      console.warn('[StorageService] Server memory fetch failed, falling back to local store:', e);
+    }
+    isInitialized = true;
+  },
+
+  getCurrentMode(): 'PAPER' | 'LIVE' {
+    if (memoryCache.currentMode === 'LIVE' || memoryCache.currentMode === 'PAPER') {
+      return memoryCache.currentMode;
+    }
+    try {
+      const mode = localStorage.getItem(KEYS.CURRENT_MODE);
+      if (mode === 'LIVE' || mode === 'PAPER') {
+        memoryCache.currentMode = mode;
+        return mode;
+      }
+    } catch (_) {}
+    return 'PAPER';
+  },
+
+  setCurrentMode(mode: 'PAPER' | 'LIVE') {
+    memoryCache.currentMode = mode;
+    try {
+      localStorage.setItem(KEYS.CURRENT_MODE, mode);
+    } catch (_) {}
+    persistToServer('currentMode', mode);
+  },
+
   getPatterns(): PatternStats[] {
+    if (memoryCache.patterns && memoryCache.patterns.length > 0) {
+      return memoryCache.patterns;
+    }
     try {
       const data = localStorage.getItem(KEYS.PATTERNS);
-      if (data) return JSON.parse(data);
-    } catch (e) {
-      console.error('Failed to load patterns from storage:', e);
-    }
+      if (data) {
+        memoryCache.patterns = JSON.parse(data);
+        return memoryCache.patterns;
+      }
+    } catch (_) {}
     const seed = generateSeedPatterns();
     this.savePatterns(seed);
     return seed;
   },
 
   savePatterns(patterns: PatternStats[]) {
+    memoryCache.patterns = patterns;
     try {
       localStorage.setItem(KEYS.PATTERNS, JSON.stringify(patterns));
-    } catch (e) {
-      console.error('Failed to save patterns to storage:', e);
-    }
+    } catch (_) {}
+    debounceSyncToServer({ patterns });
   },
 
   getSwings(): Swing[] {
+    if (memoryCache.swings && memoryCache.swings.length > 0) {
+      return memoryCache.swings;
+    }
     try {
       const data = localStorage.getItem(KEYS.SWINGS);
-      if (data) return JSON.parse(data);
-    } catch (e) {
-      console.error('Failed to load swings from storage:', e);
-    }
+      if (data) {
+        memoryCache.swings = JSON.parse(data);
+        return memoryCache.swings;
+      }
+    } catch (_) {}
     const seed = generateSeedSwings();
     this.saveSwings(seed);
     return seed;
   },
 
   saveSwings(swings: Swing[]) {
+    memoryCache.swings = swings;
     try {
       localStorage.setItem(KEYS.SWINGS, JSON.stringify(swings));
-    } catch (e) {
-      console.error('Failed to save swings to storage:', e);
-    }
+    } catch (_) {}
+    debounceSyncToServer({ swings });
   },
 
-  deduplicateById<T extends { id?: string }>(items: T[]): T[] {
-    const seen = new Set<string>();
-    const result: T[] = [];
-    for (const item of items) {
-      if (!item || !item.id) continue;
-      if (!seen.has(item.id)) {
-        seen.add(item.id);
-        result.push(item);
-      }
-    }
-    return result;
-  },
+  deduplicateById,
+  deduplicateTrades,
 
-  deduplicateTrades(trades: Trade[]): Trade[] {
-    const seen = new Set<string>();
-    const result: Trade[] = [];
-    for (const trade of trades) {
-      if (!trade || !trade.id) continue;
-      if (!seen.has(trade.id)) {
-        seen.add(trade.id);
-        result.push(trade);
-      }
+  getTrades(mode?: 'PAPER' | 'LIVE'): Trade[] {
+    const activeMode = mode || this.getCurrentMode();
+    const cacheKey = activeMode === 'LIVE' ? 'tradesLive' : 'tradesPaper';
+    if (Array.isArray(memoryCache[cacheKey]) && memoryCache[cacheKey].length > 0) {
+      return this.deduplicateTrades(memoryCache[cacheKey]);
     }
-    return result;
-  },
 
-  getTrades(): Trade[] {
+    const key = activeMode === 'LIVE' ? KEYS.TRADES_LIVE : KEYS.TRADES_PAPER;
     try {
-      const data = localStorage.getItem(KEYS.TRADES);
+      const data = localStorage.getItem(key);
       if (data) {
         const parsed = JSON.parse(data);
         if (Array.isArray(parsed)) {
           const deduped = this.deduplicateTrades(parsed);
-          if (deduped.length !== parsed.length) {
-            this.saveTrades(deduped);
-          }
+          memoryCache[cacheKey] = deduped;
           return deduped;
         }
       }
+      if (activeMode === 'PAPER') {
+        const seed = this.deduplicateTrades(generateSeedTrades());
+        this.saveTrades(seed, 'PAPER');
+        return seed;
+      }
     } catch (e) {
-      console.error('Failed to load trades from storage:', e);
+      console.error(`Failed to load ${activeMode} trades:`, e);
     }
-    const seed = this.deduplicateTrades(generateSeedTrades());
-    this.saveTrades(seed);
-    return seed;
+    return [];
   },
 
-  saveTrades(trades: Trade[]) {
+  saveTrades(trades: Trade[], mode?: 'PAPER' | 'LIVE') {
+    const activeMode = mode || this.getCurrentMode();
+    const cacheKey = activeMode === 'LIVE' ? 'tradesLive' : 'tradesPaper';
+    const key = activeMode === 'LIVE' ? KEYS.TRADES_LIVE : KEYS.TRADES_PAPER;
+    const deduped = this.deduplicateTrades(trades);
+
+    memoryCache[cacheKey] = deduped;
     try {
-      const deduped = this.deduplicateTrades(trades);
-      localStorage.setItem(KEYS.TRADES, JSON.stringify(deduped));
-    } catch (e) {
-      console.error('Failed to save trades to storage:', e);
-    }
+      localStorage.setItem(key, JSON.stringify(deduped));
+    } catch (_) {}
+
+    debounceSyncToServer({ [cacheKey]: deduped, trades: deduped });
   },
 
-  getDecisions(): DecisionLog[] {
+  getDecisions(mode?: 'PAPER' | 'LIVE'): DecisionLog[] {
+    const activeMode = mode || this.getCurrentMode();
+    const cacheKey = activeMode === 'LIVE' ? 'decisionsLive' : 'decisionsPaper';
+    if (Array.isArray(memoryCache[cacheKey]) && memoryCache[cacheKey].length > 0) {
+      return this.deduplicateById(memoryCache[cacheKey]);
+    }
+
+    const key = activeMode === 'LIVE' ? KEYS.DECISIONS_LIVE : KEYS.DECISIONS_PAPER;
     try {
-      const data = localStorage.getItem(KEYS.DECISIONS);
+      const data = localStorage.getItem(key);
       if (data) {
         const parsed = JSON.parse(data);
         if (Array.isArray(parsed)) {
           const deduped = this.deduplicateById(parsed);
-          if (deduped.length !== parsed.length) {
-            this.saveDecisions(deduped);
-          }
+          memoryCache[cacheKey] = deduped;
           return deduped;
         }
       }
+      if (activeMode === 'PAPER') {
+        const seed = this.deduplicateById(generateSeedDecisions());
+        this.saveDecisions(seed, 'PAPER');
+        return seed;
+      }
     } catch (e) {
-      console.error('Failed to load decisions from storage:', e);
+      console.error(`Failed to load ${activeMode} decisions:`, e);
     }
-    const seed = this.deduplicateById(generateSeedDecisions());
-    this.saveDecisions(seed);
-    return seed;
+    return [];
   },
 
-  saveDecisions(decisions: DecisionLog[]) {
+  saveDecisions(decisions: DecisionLog[], mode?: 'PAPER' | 'LIVE') {
+    const activeMode = mode || this.getCurrentMode();
+    const cacheKey = activeMode === 'LIVE' ? 'decisionsLive' : 'decisionsPaper';
+    const key = activeMode === 'LIVE' ? KEYS.DECISIONS_LIVE : KEYS.DECISIONS_PAPER;
+    const deduped = this.deduplicateById(decisions);
+
+    memoryCache[cacheKey] = deduped;
     try {
-      const deduped = this.deduplicateById(decisions);
-      localStorage.setItem(KEYS.DECISIONS, JSON.stringify(deduped));
-    } catch (e) {
-      console.error('Failed to save decisions to storage:', e);
-    }
+      localStorage.setItem(key, JSON.stringify(deduped));
+    } catch (_) {}
+
+    debounceSyncToServer({ [cacheKey]: deduped, decisions: deduped });
   },
 
   getSettings(): StrategySettings {
+    if (memoryCache.settings && memoryCache.settings.minConfidence) {
+      return memoryCache.settings;
+    }
     try {
       const data = localStorage.getItem(KEYS.SETTINGS);
-      if (data) return { ...DEFAULT_SETTINGS, ...JSON.parse(data) };
-    } catch (e) {
-      console.error('Failed to load settings:', e);
-    }
+      if (data) {
+        memoryCache.settings = { ...DEFAULT_SETTINGS, ...JSON.parse(data) };
+        return memoryCache.settings;
+      }
+    } catch (_) {}
     return DEFAULT_SETTINGS;
   },
 
   saveSettings(settings: StrategySettings) {
+    memoryCache.settings = settings;
     try {
       localStorage.setItem(KEYS.SETTINGS, JSON.stringify(settings));
-    } catch (e) {
-      console.error('Failed to save settings:', e);
-    }
+    } catch (_) {}
+    debounceSyncToServer({ settings });
   },
 
-  getStats(): UserStats {
-    try {
-      const data = localStorage.getItem(KEYS.STATS);
-      if (data) return { ...DEFAULT_STATS, ...JSON.parse(data) };
-    } catch (e) {
-      console.error('Failed to load stats:', e);
+  getStats(mode?: 'PAPER' | 'LIVE'): UserStats {
+    const activeMode = mode || this.getCurrentMode();
+    const cacheKey = activeMode === 'LIVE' ? 'statsLive' : 'statsPaper';
+    if (memoryCache[cacheKey] && memoryCache[cacheKey].balance !== undefined) {
+      return memoryCache[cacheKey];
     }
-    return DEFAULT_STATS;
+
+    const key = activeMode === 'LIVE' ? KEYS.STATS_LIVE : KEYS.STATS_PAPER;
+    try {
+      const data = localStorage.getItem(key);
+      if (data) {
+        const parsed = JSON.parse(data);
+        memoryCache[cacheKey] = { ...(activeMode === 'LIVE' ? DEFAULT_LIVE_STATS : DEFAULT_STATS), ...parsed };
+        return memoryCache[cacheKey];
+      }
+    } catch (_) {}
+
+    return activeMode === 'LIVE' ? { ...DEFAULT_LIVE_STATS } : { ...DEFAULT_STATS };
   },
 
-  saveStats(stats: UserStats) {
+  saveStats(stats: UserStats, mode?: 'PAPER' | 'LIVE') {
+    const activeMode = mode || this.getCurrentMode();
+    const cacheKey = activeMode === 'LIVE' ? 'statsLive' : 'statsPaper';
+    const key = activeMode === 'LIVE' ? KEYS.STATS_LIVE : KEYS.STATS_PAPER;
+
+    memoryCache[cacheKey] = stats;
     try {
-      localStorage.setItem(KEYS.STATS, JSON.stringify(stats));
-    } catch (e) {
-      console.error('Failed to save stats:', e);
-    }
+      localStorage.setItem(key, JSON.stringify(stats));
+    } catch (_) {}
+
+    debounceSyncToServer({ [cacheKey]: stats, stats });
   },
 
   getHourlyReports(): HourlyReport[] {
-    try {
-      const data = localStorage.getItem(KEYS.HOURLY_REPORTS);
-      if (data) {
-        const parsed = JSON.parse(data);
-        if (Array.isArray(parsed)) {
-          const deduped = this.deduplicateById(parsed);
-          if (deduped.length !== parsed.length) {
-            this.saveHourlyReports(deduped);
-          }
-          return deduped;
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load hourly reports from storage:', e);
-    }
-    const seed = this.deduplicateById(generateSeedHourlyReports());
-    this.saveHourlyReports(seed);
-    return seed;
+    return loadHourlyReports(memoryCache, (seed) => this.saveHourlyReports(seed));
   },
 
   saveHourlyReports(reports: HourlyReport[]) {
+    const deduped = this.deduplicateById(reports);
+    memoryCache.hourlyReports = deduped;
     try {
-      const deduped = this.deduplicateById(reports);
       localStorage.setItem(KEYS.HOURLY_REPORTS, JSON.stringify(deduped));
-      localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-    } catch (e) {
-      console.error('Failed to save hourly reports to storage:', e);
-    }
+    } catch (_) {}
+    debounceSyncToServer({ hourlyReports: deduped });
   },
 
   addHourlyReport(report: HourlyReport) {
     const list = this.getHourlyReports().filter(r => r.id !== report.id);
-    const updated = [report, ...list.slice(0, 99)]; // retain last 100 reports
+    const updated = [report, ...list.slice(0, 99)];
     this.saveHourlyReports(updated);
     return updated;
   },
@@ -242,237 +367,119 @@ export const StorageService = {
   },
 
   getDisqualifiedPatterns(): DisqualifiedPattern[] {
-    try {
-      const data = localStorage.getItem(KEYS.DISQUALIFIED);
-      if (data) {
-        const parsed = JSON.parse(data);
-        if (Array.isArray(parsed)) {
-          const deduped = this.deduplicateById(parsed);
-          if (deduped.length !== parsed.length) {
-            this.saveDisqualifiedPatterns(deduped);
-          }
-          return deduped;
-        }
-      }
-    } catch (e) {
-      console.error('Failed to load disqualified patterns from storage:', e);
-    }
-    const seed = this.deduplicateById(generateSeedDisqualifiedPatterns());
-    this.saveDisqualifiedPatterns(seed);
-    return seed;
+    return loadDisqualifiedPatterns(memoryCache, (seed) => this.saveDisqualifiedPatterns(seed));
   },
 
   saveDisqualifiedPatterns(list: DisqualifiedPattern[]) {
+    const deduped = this.deduplicateById(list);
+    memoryCache.disqualifiedPatterns = deduped;
     try {
-      const deduped = this.deduplicateById(list);
       localStorage.setItem(KEYS.DISQUALIFIED, JSON.stringify(deduped));
-      localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-    } catch (e) {
-      console.error('Failed to save disqualified patterns to storage:', e);
-    }
+    } catch (_) {}
+    debounceSyncToServer({ disqualifiedPatterns: deduped });
   },
 
   addDisqualifiedPattern(item: DisqualifiedPattern) {
     const list = this.getDisqualifiedPatterns();
-    // remove existing item for same patternTag & coin if any, then prepend
     const filtered = list.filter(i => !(i.patternTag === item.patternTag && i.coin === item.coin));
     const updated = [item, ...filtered.slice(0, 99)];
     this.saveDisqualifiedPatterns(updated);
     return updated;
   },
 
-  /**
-   * البداية من الصفر للاختبار (Clean Test Slate)
-   * يتيح للمستخدم تصفير كافة الصفقات والقرارات والبدء برأس مال نظيف 100%
-   */
   resetToCleanSlate(
-    startingCapital: number = 1000, 
-    options: { wipeTradeHistory?: boolean; wipeDecisions?: boolean; wipeDisqualified?: boolean; mode?: 'PAPER' | 'LIVE' } = {}
+    startingCapital: number = 100, 
+    options: CleanSlateOptions = {}
   ) {
-    const { wipeTradeHistory = true, wipeDecisions = true, wipeDisqualified = true, mode = 'PAPER' } = options;
-
-    // Reset trades
-    if (wipeTradeHistory) {
-      this.saveTrades([]);
-    } else {
-      this.saveActiveTrades([]);
-    }
-
-    // Reset decisions
-    if (wipeDecisions) {
-      this.saveDecisions([]);
-    }
-
-    // Reset disqualified patterns
-    if (wipeDisqualified) {
-      this.saveDisqualifiedPatterns([]);
-    }
-
-    // Clean Stats
-    const cleanStats: UserStats = {
-      balance: startingCapital,
-      initialBalance: startingCapital,
-      equity: startingCapital,
-      realizedPnL: 0,
-      winCount: 0,
-      lossCount: 0,
-      totalTrades: 0,
-      winRate: 0,
-      profitFactor: 0,
-      maxDrawdownPct: 0,
-      consecutiveLosses: 0,
-      todayLossUsd: 0,
-    };
-    this.saveStats(cleanStats);
-
-    // Update settings with user defined capital and execution mode
-    const curSettings = this.getSettings();
-    this.saveSettings({
-      ...curSettings,
-      userDefinedCapital: startingCapital,
-      tradingExecutionMode: mode,
-      autoTradingEnabled: true,
+    return performCleanSlate(startingCapital, options, {
+      saveTrades: (trades) => this.saveTrades(trades),
+      saveActiveTrades: (trades) => this.saveActiveTrades(trades),
+      saveDecisions: (decisions) => this.saveDecisions(decisions),
+      saveDisqualifiedPatterns: (patterns) => this.saveDisqualifiedPatterns(patterns),
+      saveStats: (stats) => this.saveStats(stats),
+      getSettings: () => this.getSettings(),
+      saveSettings: (settings) => this.saveSettings(settings),
+      debounceSync: debounceSyncToServer,
     });
-
-    localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-    return cleanStats;
   },
 
-  /**
-   * إحصائيات قاعدة البيانات والتخزين المحلي
-   */
   getDatabaseStats() {
-    const trades = this.getTrades();
-    const active = trades.filter(t => t.status === 'OPEN');
-    const closed = trades.filter(t => t.status === 'CLOSED');
-    const patterns = this.getPatterns();
-    const swings = this.getSwings();
-    const decisions = this.getDecisions();
-    const hourlyReports = this.getHourlyReports();
-    const disqualified = this.getDisqualifiedPatterns();
-    const lastSync = Number(localStorage.getItem(KEYS.LAST_SYNC) || Date.now());
-
-    // Approximate size in localStorage
-    let totalChars = 0;
-    Object.values(KEYS).forEach(k => {
-      const item = localStorage.getItem(k);
-      if (item) totalChars += item.length;
+    return calculateDatabaseStats({
+      trades: this.getTrades(),
+      patterns: this.getPatterns(),
+      swings: this.getSwings(),
+      decisions: this.getDecisions(),
+      hourlyReports: this.getHourlyReports(),
+      disqualified: this.getDisqualifiedPatterns(),
     });
-    const estimatedKb = Math.round((totalChars * 2) / 1024);
-
-    return {
-      totalTradesCount: trades.length,
-      activeTradesCount: active.length,
-      closedTradesCount: closed.length,
-      patternsCount: patterns.length,
-      swingsCount: swings.length,
-      decisionsCount: decisions.length,
-      hourlyReportsCount: hourlyReports.length,
-      disqualifiedCount: disqualified.length,
-      lastSyncTime: lastSync,
-      estimatedKb,
-    };
   },
 
   resetAll() {
-    localStorage.removeItem(KEYS.PATTERNS);
-    localStorage.removeItem(KEYS.SWINGS);
-    localStorage.removeItem(KEYS.TRADES);
-    localStorage.removeItem(KEYS.DECISIONS);
-    localStorage.removeItem(KEYS.SETTINGS);
-    localStorage.removeItem(KEYS.STATS);
-    localStorage.removeItem(KEYS.HOURLY_REPORTS);
-    localStorage.removeItem(KEYS.DISQUALIFIED);
-    localStorage.removeItem(KEYS.LAST_SYNC);
+    memoryCache = {
+      patterns: [],
+      swings: [],
+      tradesPaper: [],
+      tradesLive: [],
+      decisionsPaper: [],
+      decisionsLive: [],
+      statsPaper: { ...DEFAULT_STATS },
+      statsLive: { ...DEFAULT_LIVE_STATS },
+      settings: { ...DEFAULT_SETTINGS },
+      hourlyReports: [],
+      disqualifiedPatterns: [],
+      currentMode: 'PAPER'
+    };
+    try {
+      localStorage.clear();
+    } catch (_) {}
+    debounceSyncToServer(memoryCache);
+  },
+
+  resetMode(mode: 'PAPER' | 'LIVE', initialCapital?: number) {
+    const defaultBalance = initialCapital ?? 100;
+    const freshStats = createCleanStats(defaultBalance);
+    this.saveStats(freshStats, mode);
+    this.saveTrades([], mode);
+    this.saveDecisions([], mode);
   },
 
   exportMemoryJson(): string {
-    const memory = {
-      version: '2.0.0',
-      exportedAt: new Date().toISOString(),
-      patterns: this.getPatterns(),
-      swings: this.getSwings(),
-      trades: this.getTrades(),
-      decisions: this.getDecisions(),
-      settings: this.getSettings(),
-      stats: this.getStats(),
-      hourlyReports: this.getHourlyReports(),
-      disqualifiedPatterns: this.getDisqualifiedPatterns(),
-      databaseStats: this.getDatabaseStats(),
-    };
-    return JSON.stringify(memory, null, 2);
+    return exportMemoryJson(memoryCache);
   },
 
-  exportFullMemory(): string {
-    return this.exportMemoryJson();
+  exportFullMemory(): string { return this.exportMemoryJson(); },
+  importFullMemory(jsonStr: string): boolean { return this.importMemoryJson(jsonStr); },
+
+  getUserStats(mode?: 'PAPER' | 'LIVE'): UserStats { return this.getStats(mode); },
+  saveUserStats(stats: UserStats, mode?: 'PAPER' | 'LIVE') { this.saveStats(stats, mode); },
+
+  getDecisionLogs(mode?: 'PAPER' | 'LIVE'): DecisionLog[] { return this.getDecisions(mode); },
+  saveDecisionLogs(decisions: DecisionLog[], mode?: 'PAPER' | 'LIVE') { this.saveDecisions(decisions, mode); },
+
+  getActiveTrades(mode?: 'PAPER' | 'LIVE'): Trade[] {
+    return this.getTrades(mode).filter(t => t.status === 'OPEN');
   },
 
-  importFullMemory(jsonStr: string): boolean {
-    return this.importMemoryJson(jsonStr);
+  saveActiveTrades(trades: Trade[], mode?: 'PAPER' | 'LIVE') {
+    const activeMode = mode || this.getCurrentMode();
+    const closed = this.getTrades(activeMode).filter(t => t.status === 'CLOSED');
+    this.saveTrades([...trades, ...closed], activeMode);
   },
 
-  getUserStats(): UserStats {
-    return this.getStats();
+  getClosedTrades(mode?: 'PAPER' | 'LIVE'): Trade[] {
+    return this.getTrades(mode).filter(t => t.status === 'CLOSED');
   },
 
-  saveUserStats(stats: UserStats) {
-    this.saveStats(stats);
+  saveClosedTrades(closed: Trade[], mode?: 'PAPER' | 'LIVE') {
+    const activeMode = mode || this.getCurrentMode();
+    const active = this.getTrades(activeMode).filter(t => t.status === 'OPEN');
+    this.saveTrades([...active, ...closed], activeMode);
   },
 
-  getDecisionLogs(): DecisionLog[] {
-    return this.getDecisions();
-  },
-
-  saveDecisionLogs(decisions: DecisionLog[]) {
-    this.saveDecisions(decisions);
-  },
-
-  getActiveTrades(): Trade[] {
-    return this.deduplicateTrades(this.getTrades().filter(t => t.status === 'OPEN'));
-  },
-
-  saveActiveTrades(trades: Trade[]) {
-    const activeDeduped = this.deduplicateTrades(trades);
-    const activeIds = new Set(activeDeduped.map(t => t.id));
-    const closed = this.getTrades().filter(t => t.status === 'CLOSED' && !activeIds.has(t.id));
-    this.saveTrades([...activeDeduped, ...closed]);
-    localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-  },
-
-  getClosedTrades(): Trade[] {
-    return this.deduplicateTrades(this.getTrades().filter(t => t.status === 'CLOSED'));
-  },
-
-  saveClosedTrades(closed: Trade[]) {
-    const closedDeduped = this.deduplicateTrades(closed);
-    const closedIds = new Set(closedDeduped.map(t => t.id));
-    const active = this.getTrades().filter(t => t.status === 'OPEN' && !closedIds.has(t.id));
-    this.saveTrades([...active, ...closedDeduped]);
-    localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-  },
-
-  resetToFactoryTraining() {
-    this.resetAll();
-    const patterns = generateSeedPatterns();
-    const swings = generateSeedSwings();
-    const trades = generateSeedTrades();
-    const decisions = generateSeedDecisions();
-    const reports = generateSeedHourlyReports();
-    const disqualified = generateSeedDisqualifiedPatterns();
-    this.savePatterns(patterns);
-    this.saveSwings(swings);
-    this.saveTrades(trades);
-    this.saveDecisions(decisions);
-    this.saveSettings(DEFAULT_SETTINGS);
-    this.saveStats(DEFAULT_STATS);
-    this.saveHourlyReports(reports);
-    this.saveDisqualifiedPatterns(disqualified);
-    localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-  },
+  resetToFactoryTraining() { this.resetAll(); },
 
   importMemoryJson(jsonStr: string): boolean {
-    try {
-      const parsed = JSON.parse(jsonStr);
+    return importMemoryJson(jsonStr, (parsed) => {
       if (parsed.patterns) this.savePatterns(parsed.patterns);
       if (parsed.swings) this.saveSwings(parsed.swings);
       if (parsed.trades) this.saveTrades(parsed.trades);
@@ -481,11 +488,7 @@ export const StorageService = {
       if (parsed.stats) this.saveStats(parsed.stats);
       if (parsed.hourlyReports) this.saveHourlyReports(parsed.hourlyReports);
       if (parsed.disqualifiedPatterns) this.saveDisqualifiedPatterns(parsed.disqualifiedPatterns);
-      localStorage.setItem(KEYS.LAST_SYNC, String(Date.now()));
-      return true;
-    } catch (e) {
-      console.error('Failed to import memory JSON:', e);
-      return false;
-    }
+      debounceSyncToServer(parsed);
+    });
   }
 };

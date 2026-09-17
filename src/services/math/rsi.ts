@@ -33,7 +33,9 @@ export const TechnicalRSI = {
     let avgGain = gains / period;
     let avgLoss = losses / period;
 
-    if (avgLoss === 0) {
+    if (avgLoss === 0 && avgGain === 0) {
+      rsiSeries[period] = 50;
+    } else if (avgLoss === 0) {
       rsiSeries[period] = 100;
     } else if (avgGain === 0) {
       rsiSeries[period] = 0;
@@ -51,7 +53,9 @@ export const TechnicalRSI = {
       avgGain = (avgGain * (period - 1) + currentGain) / period;
       avgLoss = (avgLoss * (period - 1) + currentLoss) / period;
 
-      if (avgLoss === 0) {
+      if (avgLoss === 0 && avgGain === 0) {
+        rsiSeries[i] = 50;
+      } else if (avgLoss === 0) {
         rsiSeries[i] = 100;
       } else if (avgGain === 0) {
         rsiSeries[i] = 0;
@@ -66,10 +70,14 @@ export const TechnicalRSI = {
   },
 
   /**
-   * Calculates the latest RSI value.
+   * Calculates the latest RSI value over the exact 14-period window.
+   * If provided more closes than period + 1, slices the most recent (period + 1) closes (14 changes).
    */
   calculate(closes: number[], period: number = 14): number {
-    const series = this.calculateSeries(closes, period);
+    if (!closes || closes.length === 0) return 50;
+    // Exactly 14 periods (15 closes produce 14 price changes)
+    const windowCloses = closes.length > period + 1 ? closes.slice(-(period + 1)) : closes;
+    const series = this.calculateSeries(windowCloses, period);
     return series.length > 0 ? series[series.length - 1] : 50;
   }
 };

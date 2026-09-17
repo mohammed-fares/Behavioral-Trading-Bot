@@ -12,9 +12,11 @@
 import { Candle, Timeframe, Trade, BacktestResult, StrategySettings } from '../../types';
 import { TechnicalRSI } from '../math/rsi';
 import { TechnicalADX } from '../math/adx';
-import { FinancialMath } from '../math/financial';
+import { FinancialMath, calculateATR } from '../math/financial';
 import { ExchangeFilters } from '../risk/exchangeFilters';
 import { FuturesRiskCalculator } from '../risk/futuresRisk';
+import { hasVolumeConfirmation } from '../behavior/patternDetection';
+import { detectMarketRegime } from '../learning/regime';
 
 export interface BacktestOptions {
   symbol: string;
@@ -79,6 +81,31 @@ export const BacktestEngine = {
         const highPrice = currentCandle.high;
         const lowPrice = currentCandle.low;
 
+        // Peak price & PnL tracking
+        const currentPeak = isLong ? Math.max(activeTrade.peakPrice, highPrice) : Math.min(activeTrade.peakPrice, lowPrice);
+        activeTrade.peakPrice = currentPeak;
+        const grossReturnPct = isLong 
+          ? ((currentPeak - activeTrade.entryPrice) / activeTrade.entryPrice) * 100
+          : ((activeTrade.entryPrice - currentPeak) / activeTrade.entryPrice) * 100;
+        activeTrade.peakPnLPct = Math.max(activeTrade.peakPnLPct || 0, grossReturnPct);
+
+        // Break-Even Stop: move SL to entry + fee buffer when gross profit reaches 1.0%
+        if (activeTrade.peakPnLPct >= 1.0 && !activeTrade.isBreakEvenSet) {
+          activeTrade.stopLossPrice = isLong 
+            ? activeTrade.entryPrice * 1.0015 
+            : activeTrade.entryPrice * 0.9985;
+          activeTrade.isBreakEvenSet = true;
+        }
+
+        // Partial Take Profit: at 50% of target
+        if (activeTrade.peakPnLPct >= (activeTrade.targetPct || 2.5) * 0.5 && !activeTrade.isPartialTaken) {
+          activeTrade.isPartialTaken = true;
+          activeTrade.stopLossPrice = isLong 
+            ? activeTrade.entryPrice * 1.0015 
+            : activeTrade.entryPrice * 0.9985;
+          activeTrade.isBreakEvenSet = true;
+        }
+
         let shouldExit = false;
         let exitPrice = currentPrice;
         let exitReason: Trade['exitReason'] = undefined;
@@ -106,6 +133,19 @@ export const BacktestEngine = {
           }
         }
 
+        // Time-based exit check (open > 90 mins and profit < 0.3%)
+        const tradeMins = Math.round((currentCandle.timestamp - activeTrade.entryTime) / 60000);
+        if (!shouldExit && tradeMins >= 90) {
+          const currentProfitPct = isLong
+            ? ((currentPrice - activeTrade.entryPrice) / activeTrade.entryPrice) * 100
+            : ((activeTrade.entryPrice - currentPrice) / activeTrade.entryPrice) * 100;
+          if (currentProfitPct < 0.3) {
+            shouldExit = true;
+            exitPrice = currentPrice;
+            exitReason = 'TIMEOUT';
+          }
+        }
+
         if (shouldExit) {
           const qty = activeTrade.quantity || 0;
           const grossPnL = FinancialMath.calcPnL(activeTrade.direction, activeTrade.entryPrice, exitPrice, qty);
@@ -128,7 +168,7 @@ export const BacktestEngine = {
             realizedPnLUsd: netPnL,
             realizedPnLPct: FinancialMath.calcReturnPct(netPnL, activeTrade.marginUsd),
             feesPaidUsd: (activeTrade.feesPaidUsd || 0) + exitFee,
-            durationMinutes: Math.round((currentCandle.timestamp - activeTrade.entryTime) / 60000)
+            durationMinutes: tradeMins
           });
 
           activeTrade = null;
@@ -140,24 +180,36 @@ export const BacktestEngine = {
         const closes = historicalWindow.map(c => c.close);
         const rsi = TechnicalRSI.calculate(closes, 14);
         const adx = TechnicalADX.calculate(historicalWindow, 14);
+        const volumeOk = hasVolumeConfirmation(historicalWindow, 1.5);
+        const regime = detectMarketRegime(historicalWindow);
 
-        // Simple behavioral condition
+        // Simple behavioral condition with strict technical & regime filters
         const recentDiffPct = ((currentPrice - historicalWindow[historicalWindow.length - 10].open) / historicalWindow[historicalWindow.length - 10].open) * 100;
         let direction: 'LONG' | 'SHORT' | null = null;
 
-        if (recentDiffPct > (settings.minMovementPct || 0.5) && rsi < 68 && adx.adx > 22 && adx.plusDI > adx.minusDI) {
-          direction = 'LONG';
-        } else if (recentDiffPct < -(settings.minMovementPct || 0.5) && rsi > 32 && adx.adx > 22 && adx.minusDI > adx.plusDI) {
-          direction = 'SHORT';
+        if (regime !== 'RANGING' && volumeOk && adx.adx >= 25) {
+          if (recentDiffPct > (settings.minMovementPct || 0.5) && rsi >= 40 && rsi <= 70 && adx.plusDI > adx.minusDI) {
+            direction = 'LONG';
+          } else if (recentDiffPct < -(settings.minMovementPct || 0.5) && rsi >= 30 && rsi <= 60 && adx.minusDI > adx.plusDI) {
+            direction = 'SHORT';
+          }
         }
 
         if (direction) {
           const leverage = options.leverage || settings.leverage || 10;
-          const positionSizeUsd = capital * (settings.positionSizePct / 100) * leverage;
-          const normalizedQty = ExchangeFilters.normalizeQuantity(options.symbol, positionSizeUsd / currentPrice);
-          const filter = ExchangeFilters.validateOrder(options.symbol, currentPrice, normalizedQty);
+          let positionSizeUsd = capital * (settings.positionSizePct / 100) * leverage;
+          const filter = ExchangeFilters.getFilter(options.symbol);
+          if (positionSizeUsd < filter.minNotional && capital * leverage >= filter.minNotional) {
+            positionSizeUsd = filter.minNotional;
+          }
+          let targetQty = positionSizeUsd / currentPrice;
+          if (targetQty < filter.minQty && (filter.minQty * currentPrice / leverage) <= capital * 0.5) {
+            targetQty = filter.minQty;
+          }
+          const normalizedQty = ExchangeFilters.normalizeQuantity(options.symbol, targetQty);
+          const filterValidation = ExchangeFilters.validateOrder(options.symbol, currentPrice, normalizedQty);
 
-          if (filter.valid && normalizedQty > 0) {
+          if (filterValidation.valid && normalizedQty > 0) {
             // Apply entry slippage and fees
             const slipPct = options.slippagePct || 0.02;
             const slipPrice = direction === 'LONG' ? currentPrice * (1 + slipPct / 100) : currentPrice * (1 - slipPct / 100);
@@ -165,10 +217,19 @@ export const BacktestEngine = {
             totalFees += entryFee;
             totalSlippage += Math.abs(slipPrice - currentPrice) * normalizedQty;
 
-            const targetPct = settings.takeProfitPct || 2.5;
-            const stopLossPct = settings.stopLossPct || 1.5;
+            // Dynamic Stop Loss based on ATR (1.5 * ATR)
+            const atr = calculateATR(historicalWindow, 14);
+            const dynamicSLDistance = atr > 0 ? 1.5 * atr : (slipPrice * ((settings.stopLossPct || 1.5) / 100));
+            const stopLossPct = Math.round(((dynamicSLDistance / slipPrice) * 100) * 100) / 100;
+
+            // Dynamic Take Profit based on ADX
+            let targetPct = 2.5;
+            if (adx.adx > 35) targetPct = 3.5;
+            else if (adx.adx >= 25) targetPct = 2.5;
+            else targetPct = 1.5;
+
             const targetPrice = direction === 'LONG' ? slipPrice * (1 + targetPct / 100) : slipPrice * (1 - targetPct / 100);
-            const stopLossPrice = direction === 'LONG' ? slipPrice * (1 - stopLossPct / 100) : slipPrice * (1 + stopLossPct / 100);
+            const stopLossPrice = direction === 'LONG' ? slipPrice - dynamicSLDistance : slipPrice + dynamicSLDistance;
 
             const futuresRisk = FuturesRiskCalculator.calculate(direction, slipPrice, normalizedQty, leverage, capital);
 
@@ -293,5 +354,89 @@ export const BacktestEngine = {
       buyAndHoldReturnPct: 0,
       trades: []
     };
+  },
+
+  /**
+   * Fetches real historical candles from Binance API over a specified range with pagination.
+   */
+  async fetchHistoricalData(
+    symbol: string,
+    timeframe: Timeframe,
+    startTimeMs?: number,
+    endTimeMs?: number,
+    totalCandlesTarget: number = 1000
+  ): Promise<Candle[]> {
+    const tfMap: Record<Timeframe, string> = {
+      '1m': '1m', '5m': '5m', '15m': '15m', '30m': '30m',
+      '1h': '1h', '4h': '4h', '1d': '1d'
+    };
+    const interval = tfMap[timeframe] || '15m';
+    const allCandles: Candle[] = [];
+    let currentStart = startTimeMs;
+    const finalEnd = endTimeMs || Date.now();
+
+    while (allCandles.length < totalCandlesTarget) {
+      const fetchLimit = Math.min(1000, totalCandlesTarget - allCandles.length);
+      let url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${fetchLimit}`;
+      if (currentStart) url += `&startTime=${currentStart}`;
+      if (finalEnd) url += `&endTime=${finalEnd}`;
+
+      try {
+        const res = await fetch(url, { signal: AbortSignal.timeout(10000) });
+        if (!res.ok) break;
+        const raw = await res.json();
+        if (!Array.isArray(raw) || raw.length === 0) break;
+
+        const parsed: Candle[] = raw.map((c: any) => ({
+          timestamp: Number(c[0]),
+          openTime: Number(c[0]),
+          closeTime: Number(c[6]),
+          open: parseFloat(c[1]),
+          high: parseFloat(c[2]),
+          low: parseFloat(c[3]),
+          close: parseFloat(c[4]),
+          volume: parseFloat(c[5]),
+          isClosed: true,
+          dataSource: 'REAL_MARKET'
+        }));
+
+        allCandles.push(...parsed);
+        const lastCandle = parsed[parsed.length - 1];
+        if (!lastCandle || (currentStart && lastCandle.closeTime >= finalEnd)) break;
+        currentStart = lastCandle.closeTime + 1;
+
+        if (raw.length < fetchLimit) break;
+      } catch (err) {
+        break;
+      }
+    }
+
+    return allCandles;
+  },
+
+  /**
+   * Complete runner that fetches real historical data and runs the backtest.
+   */
+  async runBacktest(
+    symbol: string,
+    timeframe: Timeframe,
+    settings: StrategySettings,
+    options?: Partial<BacktestOptions>,
+    months: number = 6
+  ): Promise<{ inSample: BacktestResult; outOfSample: BacktestResult; totalResult: BacktestResult }> {
+    const msInMonth = 30 * 24 * 60 * 60 * 1000;
+    const startTime = Date.now() - (months * msInMonth);
+    // 15m has 96 candles per day => 180 days ~ 17280 candles. We fetch up to 10000 for fast execution.
+    const candles = await this.fetchHistoricalData(symbol, timeframe, startTime, Date.now(), 8000);
+    const fullOptions: BacktestOptions = {
+      symbol,
+      timeframe,
+      initialCapitalUsd: options?.initialCapitalUsd || 100,
+      leverage: options?.leverage || settings.leverage || 10,
+      takerFeeRate: options?.takerFeeRate || 0.0004,
+      slippagePct: options?.slippagePct || 0.02,
+      trainRatio: options?.trainRatio || 0.70
+    };
+    return this.run(candles, settings, fullOptions);
   }
 };

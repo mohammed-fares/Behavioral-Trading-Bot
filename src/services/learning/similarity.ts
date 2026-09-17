@@ -123,7 +123,7 @@ export const PatternSimilarity = {
     }
 
     // Weighted composite score (0 - 100)
-    const compositeScore = (
+    let compositeScore = (
       magScore * 25 +
       durScore * 15 +
       rsiScore * 20 +
@@ -131,8 +131,15 @@ export const PatternSimilarity = {
       regimeScore * 25
     );
 
+    // Recency weight: Patterns within the last 30 days get 1.5x weight factor (boost score by up to 5%)
+    const now = Date.now();
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    if (storedPattern.lastOccurredAt && (now - storedPattern.lastOccurredAt) <= thirtyDaysMs) {
+      compositeScore = Math.min(100, compositeScore * 1.05); // Recency boosted
+    }
+
     const roundedScore = Math.round(compositeScore * 10) / 10;
-    const isEligible = roundedScore >= 75; // strict eligibility threshold
+    const isEligible = roundedScore >= 80; // strict 80% threshold
 
     return {
       score: roundedScore,

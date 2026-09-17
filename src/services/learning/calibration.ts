@@ -6,6 +6,16 @@
 
 import { CalibratedConfidence } from '../../types';
 
+export function wilsonScore(wins: number, total: number, confidence: number = 0.95): number {
+  if (total === 0) return 0;
+  const z = confidence === 0.99 ? 2.576 : 1.96; // default 95% confidence
+  const phat = wins / total;
+  const denominator = 1 + (z * z) / total;
+  const center = phat + (z * z) / (2 * total);
+  const spread = z * Math.sqrt((phat * (1 - phat) + (z * z) / (4 * total)) / total);
+  return Math.max(0, Math.min(100, ((center - spread) / denominator) * 100));
+}
+
 export const ProbabilityCalibration = {
   /**
    * Calculates Wilson Score lower and upper bounds for a proportion (win rate).

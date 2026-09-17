@@ -10,25 +10,10 @@
 
 import { Candle, Timeframe, DataSource, MarketType } from '../../types';
 import { AuditLogger } from '../audit/auditLogger';
+import { MarketTicker } from './types';
+import { MarketWebSocketClient } from './marketWebSocket';
 
-export interface MarketTicker {
-  symbol: string;
-  marketType: MarketType;
-  lastPrice: number;
-  markPrice?: number;
-  bid: number;
-  ask: number;
-  spreadPct: number;
-  change24h: number;
-  high24h: number;
-  low24h: number;
-  volume24h: number;
-  fundingRate?: number;
-  exchangeTime: number;
-  localReceiveTime: number;
-  dataSource: DataSource;
-  isStale: boolean;
-}
+export type { MarketTicker } from './types';
 
 const DEFAULT_FALLBACK_PRICES: Record<string, number> = {
   'BTCUSDT': 65420.5,
@@ -49,6 +34,60 @@ export class MarketDataLayerService {
   public isOnline: boolean = true;
   public lastSuccessfulFetchTime: number = Date.now();
   public reconnectAttempts: number = 0;
+  private wsClient: MarketWebSocketClient | null = null;
+  public wsConnected: boolean = false;
+  private listeners: Set<(tickers: Record<string, MarketTicker>) => void> = new Set();
+
+  constructor() {
+    this.initWebSocket();
+  }
+
+  /**
+   * Initialize real-time WebSocket connection to the bot server stream
+   */
+  public initWebSocket() {
+    if (typeof window === 'undefined') return;
+    if (this.wsClient) return;
+
+    this.wsClient = new MarketWebSocketClient(
+      Object.keys(DEFAULT_FALLBACK_PRICES),
+      (updated) => {
+        const now = Date.now();
+        this.lastSuccessfulFetchTime = now;
+        this.isOnline = true;
+        this.wsConnected = true;
+        Object.entries(updated).forEach(([sym, ticker]) => {
+          this.lastTickers.set(`USDT_M_FUTURES_${sym}`, ticker);
+          this.lastTickers.set(`SPOT_${sym}`, { ...ticker, marketType: 'SPOT' });
+        });
+        this.notifyListeners(updated);
+      },
+      (connected) => {
+        this.wsConnected = connected;
+        if (connected) {
+          this.isOnline = true;
+          this.reconnectAttempts = 0;
+          this.lastSuccessfulFetchTime = Date.now();
+        }
+      }
+    );
+  }
+
+  /**
+   * Subscribe to real-time WebSocket ticker updates
+   */
+  public subscribeTickers(cb: (tickers: Record<string, MarketTicker>) => void): () => void {
+    this.listeners.add(cb);
+    return () => {
+      this.listeners.delete(cb);
+    };
+  }
+
+  private notifyListeners(tickers: Record<string, MarketTicker>) {
+    this.listeners.forEach(cb => {
+      try { cb(tickers); } catch (_) {}
+    });
+  }
 
   /**
    * Check connection status
@@ -56,6 +95,7 @@ export class MarketDataLayerService {
   getConnectionStatus() {
     return {
       isOnline: this.isOnline,
+      wsConnected: this.wsConnected,
       lastSuccessfulFetchTime: this.lastSuccessfulFetchTime,
       reconnectAttempts: this.reconnectAttempts,
       isStale: Date.now() - this.lastSuccessfulFetchTime > 15000
@@ -101,6 +141,22 @@ export class MarketDataLayerService {
    */
   async fetchTickers(marketType: MarketType, executionMode: 'PAPER' | 'LIVE' | 'SYNTHETIC' | 'BACKTEST'): Promise<Record<string, MarketTicker>> {
     const now = Date.now();
+
+    // Fast-path: Return fresh real-time tickers streamed via WebSocket if available
+    const symbols = Object.keys(DEFAULT_FALLBACK_PRICES);
+    const wsTickersAvailable = symbols.every(sym => {
+      const cached = this.lastTickers.get(`${marketType}_${sym}`);
+      return cached && (now - cached.localReceiveTime < 6000);
+    });
+
+    if (wsTickersAvailable) {
+      const result: Record<string, MarketTicker> = {};
+      symbols.forEach(sym => {
+        result[sym] = this.lastTickers.get(`${marketType}_${sym}`)!;
+      });
+      return result;
+    }
+
     if (now < this.backoffUntil) {
       AuditLogger.warn('MARKET_DATA', 'RATE_LIMIT_ACTIVE', `Market data backoff active for ${Math.round((this.backoffUntil - now) / 1000)}s`);
       return this.getCachedOrEmpty(marketType, executionMode);
@@ -378,4 +434,63 @@ export class MarketDataLayerService {
   }
 }
 
+export interface SymbolPerformance {
+  symbol: string;
+  winRate: number;
+  profitFactor: number;
+  sharpe: number;
+  totalTrades: number;
+  volatility: number;
+  trend: 'UP' | 'DOWN' | 'SIDEWAYS';
+}
+
 export const MarketDataLayer = new MarketDataLayerService();
+
+export function getSymbolPerformance(symbol: string, trades: any[] = [], candles: any[] = []): SymbolPerformance {
+  const symTrades = trades.filter(t => t.coin === symbol && t.status === 'CLOSED');
+  const wins = symTrades.filter(t => (t.realizedPnLUsd || 0) > 0);
+  const totalTrades = symTrades.length;
+  const winRate = totalTrades > 0 ? (wins.length / totalTrades) * 100 : 50;
+
+  const totalGains = wins.reduce((s, t) => s + (t.realizedPnLUsd || 0), 0);
+  const losses = symTrades.filter(t => (t.realizedPnLUsd || 0) < 0);
+  const totalLosses = Math.abs(losses.reduce((s, t) => s + (t.realizedPnLUsd || 0), 0));
+  const profitFactor = totalLosses > 0 ? totalGains / totalLosses : (totalGains > 0 ? 2.5 : 1.0);
+
+  // Sharpe estimation from trade returns
+  let sharpe = 1.0;
+  if (totalTrades >= 5) {
+    const returns = symTrades.map(t => t.realizedPnLPct || 0);
+    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
+    const variance = returns.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / returns.length;
+    const stdDev = Math.sqrt(variance);
+    sharpe = stdDev > 0 ? Math.round(((mean / stdDev) * Math.sqrt(365)) * 100) / 100 : 1.0;
+  }
+
+  // Volatility from recent candles if available
+  let volatility = 2.0;
+  let trend: 'UP' | 'DOWN' | 'SIDEWAYS' = 'SIDEWAYS';
+  if (candles && candles.length >= 20) {
+    const closes = candles.slice(-20).map(c => c.close);
+    const returns = [];
+    for (let i = 1; i < closes.length; i++) {
+      returns.push(Math.abs((closes[i] - closes[i - 1]) / closes[i - 1]) * 100);
+    }
+    volatility = Math.round((returns.reduce((a, b) => a + b, 0) / returns.length) * 100) / 100;
+    const firstClose = closes[0];
+    const lastClose = closes[closes.length - 1];
+    const change = ((lastClose - firstClose) / firstClose) * 100;
+    if (change > 1.0) trend = 'UP';
+    else if (change < -1.0) trend = 'DOWN';
+  }
+
+  return {
+    symbol,
+    winRate: Math.round(winRate * 10) / 10,
+    profitFactor: Math.round(profitFactor * 100) / 100,
+    sharpe,
+    totalTrades,
+    volatility: Math.max(0.1, volatility),
+    trend
+  };
+}

@@ -267,6 +267,8 @@ export interface Trade {
   currentPnLPct: number;
   isTrailingActive: boolean;
   trailingStopPrice?: number;
+  isBreakEvenSet?: boolean;
+  isPartialTaken?: boolean;
   status: 'OPEN' | 'CLOSED';
   
   // Exit info

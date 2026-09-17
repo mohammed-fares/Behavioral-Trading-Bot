@@ -3,6 +3,23 @@
  * Bypasses standard IEEE-754 floating point issues in critical trade calculations.
  */
 
+import { Candle } from '../../types';
+
+export function calculateATR(candles: Candle[], period: number = 14): number {
+  if (!candles || candles.length < period + 1) return 0;
+  const trs: number[] = [];
+  for (let i = 1; i < candles.length; i++) {
+    const tr = Math.max(
+      candles[i].high - candles[i].low,
+      Math.abs(candles[i].high - candles[i - 1].close),
+      Math.abs(candles[i].low - candles[i - 1].close)
+    );
+    trs.push(tr);
+  }
+  const recent = trs.slice(-period);
+  return recent.reduce((a, b) => a + b, 0) / period;
+}
+
 export const FinancialMath = {
   /**
    * Rounds a number to a specific number of decimal places without floating drift.
