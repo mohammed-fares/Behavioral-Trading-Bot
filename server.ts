@@ -123,6 +123,23 @@ app.post("/api/memory", (req, res) => {
   }
 });
 
+// 2.5. Binance Ping Proxy
+app.get("/api/binance/ping", async (req, res) => {
+  try {
+    const response = await fetch("https://fapi.binance.com/fapi/v1/ping", { signal: AbortSignal.timeout(4000) });
+    if (response.ok) {
+      return res.json({ success: true, serverTime: Date.now() });
+    }
+  } catch (_) {}
+  try {
+    const spotRes = await fetch("https://api.binance.com/api/v3/ping", { signal: AbortSignal.timeout(4000) });
+    if (spotRes.ok) {
+      return res.json({ success: true, serverTime: Date.now() });
+    }
+  } catch (_) {}
+  res.status(503).json({ success: false, error: "Binance unreachable" });
+});
+
 // 3. Binance Public Tickers Proxy (CORS & Rate limit protection)
 app.get("/api/binance/tickers", async (req, res) => {
   try {
@@ -131,12 +148,22 @@ app.get("/api/binance/tickers", async (req, res) => {
       ? "https://fapi.binance.com/fapi/v1/ticker/24hr"
       : "https://api.binance.com/api/v3/ticker/24hr";
 
-    const response = await fetch(endpoint, { signal: AbortSignal.timeout(4500) });
-    if (!response.ok) {
-      return res.status(response.status).json({ error: "Binance API ticker request failed", status: response.status });
+    try {
+      const response = await fetch(endpoint, { signal: AbortSignal.timeout(7000) });
+      if (response.ok) {
+        const data = await response.json();
+        return res.json({ success: true, data });
+      }
+    } catch (_) {}
+
+    // Fallback to spot if futures ticker request encounters transient glitch
+    const fallbackEndpoint = "https://api.binance.com/api/v3/ticker/24hr";
+    const fallbackRes = await fetch(fallbackEndpoint, { signal: AbortSignal.timeout(7000) });
+    if (fallbackRes.ok) {
+      const data = await fallbackRes.json();
+      return res.json({ success: true, data, fallback: true });
     }
-    const data = await response.json();
-    res.json({ success: true, data });
+    res.status(502).json({ success: false, error: "Both Binance futures and spot tickers failed" });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message || "Failed to fetch tickers" });
   }
@@ -149,17 +176,30 @@ app.get("/api/binance/klines", async (req, res) => {
     const interval = (req.query.interval as string) || "15m";
     const limit = (req.query.limit as string) || "100";
     const marketType = (req.query.marketType as string) || "USDT_M_FUTURES";
+    const startTime = req.query.startTime ? `&startTime=${req.query.startTime}` : "";
+    const endTime = req.query.endTime ? `&endTime=${req.query.endTime}` : "";
 
     const baseUrl = marketType === "USDT_M_FUTURES"
-      ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
-      : `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+      ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}${startTime}${endTime}`
+      : `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}${startTime}${endTime}`;
 
-    const response = await fetch(baseUrl, { signal: AbortSignal.timeout(4500) });
-    if (!response.ok) {
-      return res.status(response.status).json({ error: "Klines fetch failed", status: response.status });
+    try {
+      const response = await fetch(baseUrl, { signal: AbortSignal.timeout(7000) });
+      if (response.ok) {
+        const data = await response.json();
+        return res.json({ success: true, data });
+      }
+    } catch (_) {}
+
+    // Fallback to spot klines if futures encounters rate-limit or network hiccup
+    const spotUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}${startTime}${endTime}`;
+    const spotRes = await fetch(spotUrl, { signal: AbortSignal.timeout(7000) });
+    if (spotRes.ok) {
+      const data = await spotRes.json();
+      return res.json({ success: true, data, fallback: true });
     }
-    const data = await response.json();
-    res.json({ success: true, data });
+
+    res.status(502).json({ error: "Klines fetch failed across both Futures and Spot endpoints" });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message || "Failed to fetch klines" });
   }

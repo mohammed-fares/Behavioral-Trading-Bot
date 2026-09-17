@@ -257,39 +257,49 @@ export const BehaviorEngine = {
     if (pattern) {
       const wins = pattern.continuedCount || Math.round(((pattern.confidence || 50) / 100) * pattern.occurrences);
       const wilsonConf = Math.round(wilsonScore(wins, pattern.occurrences, 0.95));
-      initialConfidence = wilsonConf > 0 ? wilsonConf : (pattern.confidence || Math.round(pattern.continuationRate));
-      const occPassed = pattern.occurrences >= settings.minOccurrences;
-      const confPassed = initialConfidence >= settings.minConfidence;
-      const simPassed = !similarity || similarity.score >= (settings.minSimilarityPct || 80);
+      const rawRate = pattern.confidence || Math.round(pattern.continuationRate || (wins / (pattern.occurrences || 1)) * 100);
+      // Balanced blended confidence preventing collapse of small real-world samples
+      const effectiveConf = pattern.occurrences >= 20 
+        ? Math.round(wilsonConf * 0.5 + rawRate * 0.5) 
+        : Math.round(rawRate * 0.7 + (wilsonConf || rawRate) * 0.3);
+      initialConfidence = Math.max(35, effectiveConf);
+
+      const reqOccurrences = settings.minOccurrences || 3;
+      const reqConfidence = settings.minConfidence || 55;
+      const reqSimilarity = settings.minSimilarityPct || 70;
+
+      const occPassed = pattern.occurrences >= reqOccurrences;
+      const confPassed = initialConfidence >= reqConfidence;
+      const simPassed = !similarity || similarity.score >= reqSimilarity;
       patternPassed = occPassed && confPassed && simPassed;
 
       reviewSteps.push({
         name: 'فحص النمط ومؤشر ويلسون الإحصائي (Wilson Score)',
         passed: occPassed && confPassed,
-        detail: `تكرر ${pattern.occurrences} مرة (المطلوب ≥ ${settings.minOccurrences}) | ثقة ويلسون الإحصائية: ${initialConfidence}% (المطلوب ≥ ${settings.minConfidence}%)`,
+        detail: `تكرر ${pattern.occurrences} مرة (المطلوب ≥ ${reqOccurrences}) | ثقة ويلسون الإحصائية: ${initialConfidence}% (المطلوب ≥ ${reqConfidence}%)`,
         metric: `${initialConfidence}% Wilson`,
-        threshold: `≥ ${settings.minConfidence}%`,
+        threshold: `≥ ${reqConfidence}%`,
       });
 
       if (similarity) {
         reviewSteps.push({
           name: 'المطابقة السلوكية المتعددة الأبعاد (Pattern Similarity)',
           passed: simPassed,
-          detail: `درجة التشابه: ${similarity.score}% (المطلوب ≥ ${settings.minSimilarityPct || 80}%) | تطابق النظام: ${similarity.regimeMatch ? 'نعم' : 'لا'}`,
+          detail: `درجة التشابه: ${similarity.score}% (المطلوب ≥ ${reqSimilarity}%) | تطابق النظام: ${similarity.regimeMatch ? 'نعم' : 'لا'}`,
           metric: `${similarity.score}%`,
-          threshold: `≥ ${settings.minSimilarityPct || 80}%`
+          threshold: `≥ ${reqSimilarity}%`
         });
-        if (!simPassed) reasons.push(`درجة تشابه النمط (${similarity.score}%) أقل من الحد الأدنى (${settings.minSimilarityPct || 80}%)`);
+        if (!simPassed) reasons.push(`درجة تشابه النمط (${similarity.score}%) أقل من الحد الأدنى (${reqSimilarity}%)`);
       }
 
-      if (!occPassed) reasons.push(`عدد التكرارات في الذاكرة (${pattern.occurrences}) أقل من الحد الأدنى (${settings.minOccurrences})`);
-      if (!confPassed) reasons.push(`ثقة ويلسون الإحصائية (${initialConfidence}%) أقل من الحد الأدنى (${settings.minConfidence}%)`);
+      if (!occPassed) reasons.push(`عدد التكرارات في الذاكرة (${pattern.occurrences}) أقل من الحد الأدنى (${reqOccurrences})`);
+      if (!confPassed) reasons.push(`ثقة ويلسون الإحصائية (${initialConfidence}%) أقل من الحد الأدنى (${reqConfidence}%)`);
     } else {
       reviewSteps.push({
         name: 'فحص النمط في الذاكرة',
         passed: false,
         detail: `النمط ${patternTag} جديد ولم يسجل في الذاكرة بعد (0 تكرارات)`,
-        threshold: `≥ ${settings.minOccurrences}`,
+        threshold: `≥ ${settings.minOccurrences || 3}`,
       });
       reasons.push('نمط جديد تماماً يحتاج لبناء ذاكرة تاريخية قبل التداول');
     }
@@ -321,18 +331,18 @@ export const BehaviorEngine = {
       symbolPerfPassed = false;
       reasons.push(`أداء العملة ضعيف تاريخياً (Sharpe = ${symbolPerf.sharpe} < 0.5) (POOR_SYMBOL_PERFORMANCE)`);
     }
-    if (symbolPerf.volatility < 1.0) {
+    if (symbolPerf.volatility < 0.05) {
       symbolPerfPassed = false;
-      reasons.push(`تقلب العملة منخفض (${symbolPerf.volatility}% < 1.0%) (LOW_VOLATILITY)`);
-    } else if (symbolPerf.volatility > 5.0) {
+      reasons.push(`تقلب العملة منخفض جداً (${symbolPerf.volatility}% < 0.05%) (LOW_VOLATILITY)`);
+    } else if (symbolPerf.volatility > 6.0) {
       symbolPerfPassed = false;
-      reasons.push(`تقلب العملة مفرط (${symbolPerf.volatility}% > 5.0%) (EXTREME_VOLATILITY)`);
+      reasons.push(`تقلب العملة مفرط (${symbolPerf.volatility}% > 6.0%) (EXTREME_VOLATILITY)`);
     }
     reviewSteps.push({
       name: 'فحص أداء وتقلب العملة (Symbol Selection)',
       passed: symbolPerfPassed,
       detail: `نسبة شارب: ${symbolPerf.sharpe} | معدل التقلب: ${symbolPerf.volatility}% | الصفقات السابقة: ${symbolPerf.totalTrades}`,
-      threshold: 'Sharpe >= 0.5 & Volatility [1.0% - 5.0%]'
+      threshold: 'Sharpe >= 0.5 & Volatility [0.05% - 6.0%]'
     });
 
     // Step 1.5: Anti-Repetition Rule (منع تكرار الأخطاء والاستراتيجيات الخاسرة)
@@ -364,19 +374,21 @@ export const BehaviorEngine = {
     }
 
     // Step 2: Timeframe Alignment Review
-    const alignmentPassed = alignment.supportingCount >= settings.minSupportingFrames && alignment.opposingCount <= settings.maxOpposingAllowed;
+    const minSup = settings.minSupportingFrames || 3;
+    const maxOpp = settings.maxOpposingAllowed !== undefined ? settings.maxOpposingAllowed : 2;
+    const alignmentPassed = alignment.supportingCount >= minSup && alignment.opposingCount <= maxOpp;
     reviewSteps.push({
       name: 'توافق الأطر السبعة',
       passed: alignmentPassed,
-      detail: `${alignment.supportingCount}/7 أطر داعمة | ${alignment.opposingCount} أطر معارضة (الحد الأقصى المسموح للمعارضة: ${settings.maxOpposingAllowed})`,
+      detail: `${alignment.supportingCount}/7 أطر داعمة | ${alignment.opposingCount} أطر معارضة (الحد الأقصى المسموح للمعارضة: ${maxOpp})`,
       metric: `${alignment.supportingCount}/7 داعمة`,
-      threshold: `≥ ${settings.minSupportingFrames}/7`,
+      threshold: `≥ ${minSup}/7`,
     });
     if (!alignmentPassed) {
-      if (alignment.opposingCount > settings.maxOpposingAllowed) {
+      if (alignment.opposingCount > maxOpp) {
         reasons.push(`تعارض شديد: ${alignment.opposingCount} أطر تعارض الاتجاه`);
       } else {
-        reasons.push(`توافق الأطر (${alignment.supportingCount}/7) أقل من المطلوب (${settings.minSupportingFrames}/7)`);
+        reasons.push(`توافق الأطر (${alignment.supportingCount}/7) أقل من المطلوب (${minSup}/7)`);
       }
     }
 
@@ -385,7 +397,7 @@ export const BehaviorEngine = {
     let hourPassed = true;
     if (pattern && pattern.bestHours && pattern.bestHours[currentUtcHour]) {
       const hStat = pattern.bestHours[currentUtcHour];
-      if (hStat.winRate >= 70) {
+      if (hStat.winRate >= 70 && hStat.count >= 2) {
         hourBonus = 5;
         reviewSteps.push({
           name: 'مراجعة توقيت التداول (ساعة الذروة)',
@@ -393,13 +405,13 @@ export const BehaviorEngine = {
           detail: `الساعة ${currentUtcHour}:00 UTC ساعة ذهبية بنسبة فوز ${hStat.winRate}% (+5% بونص ثقة)`,
           metric: `${hStat.winRate}% WinRate`,
         });
-      } else if (hStat.winRate < 45) {
+      } else if (hStat.winRate < 45 && hStat.count >= 3) {
         hourBonus = -15;
         hourPassed = false;
         reviewSteps.push({
           name: 'مراجعة توقيت التداول (ساعة هابطة)',
           passed: false,
-          detail: `الساعة ${currentUtcHour}:00 UTC ساعة ضعيفة تاريخياً بنسبة نجاح ${hStat.winRate}% فقط`,
+          detail: `الساعة ${currentUtcHour}:00 UTC ساعة ضعيفة تاريخياً بنسبة نجاح ${hStat.winRate}% فقط (عينة ${hStat.count})`,
           metric: `${hStat.winRate}%`,
         });
         reasons.push(`الساعة ${currentUtcHour}:00 UTC غير ملائمة للتداول تاريخياً`);
@@ -461,16 +473,18 @@ export const BehaviorEngine = {
 
     // Decision Status Determination
     let status: 'APPROVED' | 'REJECTED' | 'WAIT' = 'REJECTED';
+    const minConfThresh = settings.minConfidence || 55;
+    const minOccThresh = settings.minOccurrences || 3;
 
-    if (patternPassed && alignmentPassed && hourPassed && tradesPassed && riskPassed && antiRepetitionPassed && technicalFiltersPassed && regimePassed && symbolPerfPassed && finalConfidence >= settings.minConfidence) {
+    if (patternPassed && alignmentPassed && hourPassed && tradesPassed && riskPassed && antiRepetitionPassed && technicalFiltersPassed && regimePassed && symbolPerfPassed && finalConfidence >= minConfThresh) {
       status = 'APPROVED';
       reasons.unshift(`المعايير مكتملة بنجاح: ثقة نهائية ${finalConfidence}% مع توافق ${alignment.supportingCount}/7 أطر`);
     } else if (!antiRepetitionPassed) {
       status = 'REJECTED';
       // reason already added in anti-repetition step
-    } else if (pattern && pattern.occurrences < settings.minOccurrences && pattern.occurrences >= 5 && alignment.supportingCount >= 4) {
+    } else if (pattern && pattern.occurrences < minOccThresh && pattern.occurrences >= 2 && alignment.supportingCount >= 3) {
       status = 'WAIT';
-      reasons.unshift(`النمط واعد لكنه نادر (${pattern.occurrences} تكرار < ${settings.minOccurrences} مطلوب). تم وضعه في قائمة المراقبة النشطة`);
+      reasons.unshift(`النمط واعد لكنه نادر (${pattern.occurrences} تكرار < ${minOccThresh} مطلوب). تم وضعه في قائمة المراقبة النشطة`);
     } else {
       status = 'REJECTED';
       if (reasons.length === 0) reasons.push('لم يتم استيفاء شروط الدخول الصارمة');

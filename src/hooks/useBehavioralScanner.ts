@@ -69,11 +69,11 @@ export function useBehavioralScanner({
 
         if (!candles15m || candles15m.length < 10) continue;
 
-        const swingResult = BehaviorEngine.detectSwingAndPattern(coin, '15m', candles15m, settings.minMovementPct || 0.5);
+        const swingResult = BehaviorEngine.detectSwingAndPattern(coin, '15m', candles15m, settings.minMovementPct || 0.4);
 
         if (swingResult) {
           const { swing, patternTag } = swingResult;
-          const patternStat = BehaviorEngine.findPatternStats(patternTag, patterns);
+          const patternStat = BehaviorEngine.findPatternStats(patternTag, patterns, coin);
           const currentPrice = tickers[coin]?.price || swing.endPrice;
           const regime = RegimeDetector.detect(candles15m);
 
@@ -100,10 +100,10 @@ export function useBehavioralScanner({
                     coin,
                     tf.id,
                     tfCandles,
-                    settings.minMovementPct || 0.4
+                    settings.minMovementPct || 0.35
                   );
                   if (tfSwingResult) {
-                    const tfStat = BehaviorEngine.findPatternStats(tfSwingResult.patternTag, patterns);
+                    const tfStat = BehaviorEngine.findPatternStats(tfSwingResult.patternTag, patterns, coin);
                     return {
                       timeframe: tf.id,
                       direction: tfSwingResult.swing.direction,
@@ -147,8 +147,9 @@ export function useBehavioralScanner({
             settings,
             stats,
             disqualifiedPatterns,
-            settings.tradingExecutionMode === 'LIVE' ? 'REAL_MARKET' : 'SYNTHETIC',
-            regime
+            'REAL_MARKET',
+            regime,
+            candles15m
           );
 
           const tradeDirection = decision.direction === 'UP' ? 'LONG' : 'SHORT';

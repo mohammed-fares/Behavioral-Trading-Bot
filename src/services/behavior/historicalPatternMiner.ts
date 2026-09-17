@@ -41,45 +41,65 @@ export async function fetchBinanceHistoricalCandles(
     const remaining = totalNeeded - allCandles.length;
     const fetchLimit = Math.min(1000, remaining);
     
-    let url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${fetchLimit}`;
-    if (currentEndTime) {
-      url += `&endTime=${currentEndTime}`;
-    }
+    let raw: any = null;
 
+    // 1. Try server proxy first (bypasses browser CORS restrictions)
     try {
-      let res = await fetch(url, { signal: AbortSignal.timeout(6000) });
-      if (!res.ok) {
-        // Fallback to spot
-        let spotUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${fetchLimit}`;
-        if (currentEndTime) spotUrl += `&endTime=${currentEndTime}`;
-        res = await fetch(spotUrl, { signal: AbortSignal.timeout(6000) });
+      let proxyUrl = `/api/binance/klines?symbol=${symbol}&interval=${interval}&limit=${fetchLimit}&marketType=USDT_M_FUTURES`;
+      if (currentEndTime) proxyUrl += `&endTime=${currentEndTime}`;
+      const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(7000) });
+      if (proxyRes.ok) {
+        const json = await proxyRes.json();
+        if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+          raw = json.data;
+        }
+      }
+    } catch (_) {}
+
+    // 2. Direct futures fallback
+    if (!raw) {
+      let url = `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${fetchLimit}`;
+      if (currentEndTime) {
+        url += `&endTime=${currentEndTime}`;
       }
 
-      if (!res.ok) break;
-      const raw = await res.json();
-      if (!Array.isArray(raw) || raw.length === 0) break;
+      try {
+        let res = await fetch(url, { signal: AbortSignal.timeout(6000) });
+        if (!res.ok) {
+          // Fallback to spot
+          let spotUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${fetchLimit}`;
+          if (currentEndTime) spotUrl += `&endTime=${currentEndTime}`;
+          res = await fetch(spotUrl, { signal: AbortSignal.timeout(6000) });
+        }
 
-      const parsed: Candle[] = raw.map((c: any) => ({
-        timestamp: Number(c[0]),
-        openTime: Number(c[0]),
-        closeTime: Number(c[6]),
-        open: parseFloat(c[1]),
-        high: parseFloat(c[2]),
-        low: parseFloat(c[3]),
-        close: parseFloat(c[4]),
-        volume: parseFloat(c[5]),
-        isClosed: true,
-      }));
-
-      // Prepend because we fetch backward in time
-      allCandles.unshift(...parsed);
-
-      if (raw.length < fetchLimit) break; // No more data available
-      currentEndTime = Number(raw[0][0]) - 1; // Earlier than first candle
-    } catch (err) {
-      console.warn(`[HistoricalPatternMiner] Fetch warning for ${symbol}:`, err);
-      break;
+        if (res.ok) {
+          const directData = await res.json();
+          if (Array.isArray(directData) && directData.length > 0) {
+            raw = directData;
+          }
+        }
+      } catch (_) {}
     }
+
+    if (!Array.isArray(raw) || raw.length === 0) break;
+
+    const parsed: Candle[] = raw.map((c: any) => ({
+      timestamp: Number(c[0]),
+      openTime: Number(c[0]),
+      closeTime: Number(c[6]),
+      open: parseFloat(c[1]),
+      high: parseFloat(c[2]),
+      low: parseFloat(c[3]),
+      close: parseFloat(c[4]),
+      volume: parseFloat(c[5]),
+      isClosed: true,
+    }));
+
+    // Prepend because we fetch backward in time
+    allCandles.unshift(...parsed);
+
+    if (raw.length < fetchLimit) break; // No more data available
+    currentEndTime = Number(raw[0][0]) - 1; // Earlier than first candle
   }
 
   // Deduplicate and sort chronologically

@@ -289,12 +289,19 @@ export const StorageService = {
 
   getSettings(): StrategySettings {
     if (memoryCache.settings && memoryCache.settings.minConfidence) {
+      if (memoryCache.settings.minOccurrences > 10) memoryCache.settings.minOccurrences = 3;
+      if (memoryCache.settings.minSupportingFrames > 4) memoryCache.settings.minSupportingFrames = 3;
+      if (memoryCache.settings.minConfidence > 65) memoryCache.settings.minConfidence = 55;
       return memoryCache.settings;
     }
     try {
       const data = localStorage.getItem(KEYS.SETTINGS);
       if (data) {
-        memoryCache.settings = { ...DEFAULT_SETTINGS, ...JSON.parse(data) };
+        const parsed = JSON.parse(data);
+        if (parsed.minOccurrences > 10) parsed.minOccurrences = 3;
+        if (parsed.minSupportingFrames > 4) parsed.minSupportingFrames = 3;
+        if (parsed.minConfidence > 65) parsed.minConfidence = 55;
+        memoryCache.settings = { ...DEFAULT_SETTINGS, ...parsed };
         return memoryCache.settings;
       }
     } catch (_) {}

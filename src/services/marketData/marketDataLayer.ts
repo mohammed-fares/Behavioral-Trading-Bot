@@ -28,6 +28,7 @@ const DEFAULT_FALLBACK_PRICES: Record<string, number> = {
 
 export class MarketDataLayerService {
   private lastTickers: Map<string, MarketTicker> = new Map();
+  private candleCache: Map<string, { candles: Candle[]; timestamp: number }> = new Map();
   private lastRequestTime: number = 0;
   private minIntervalMs: number = 250; // Rate limit guard
   private backoffUntil: number = 0;
@@ -107,30 +108,38 @@ export class MarketDataLayerService {
    */
   async checkConnection(): Promise<boolean> {
     try {
-      const res = await fetch('https://fapi.binance.com/fapi/v1/ping', {
-        signal: AbortSignal.timeout(2500)
-      });
+      // 1. Check local server proxy ping
+      const res = await fetch('/api/binance/ping', { signal: AbortSignal.timeout(3000) });
       if (res.ok) {
         this.isOnline = true;
         this.reconnectAttempts = 0;
         this.lastSuccessfulFetchTime = Date.now();
         return true;
       }
-    } catch {
-      try {
-        const spot = await fetch('https://api.binance.com/api/v3/ping', {
-          signal: AbortSignal.timeout(2500)
-        });
-        if (spot.ok) {
-          this.isOnline = true;
-          this.reconnectAttempts = 0;
-          this.lastSuccessfulFetchTime = Date.now();
-          return true;
-        }
-      } catch {
-        // failed
+    } catch (_) {}
+
+    try {
+      // 2. Direct spot ping fallback
+      const spot = await fetch('https://api.binance.com/api/v3/ping', { signal: AbortSignal.timeout(3000) });
+      if (spot.ok) {
+        this.isOnline = true;
+        this.reconnectAttempts = 0;
+        this.lastSuccessfulFetchTime = Date.now();
+        return true;
       }
-    }
+    } catch (_) {}
+
+    try {
+      // 3. Direct futures ping fallback
+      const fapi = await fetch('https://fapi.binance.com/fapi/v1/ping', { signal: AbortSignal.timeout(3000) });
+      if (fapi.ok) {
+        this.isOnline = true;
+        this.reconnectAttempts = 0;
+        this.lastSuccessfulFetchTime = Date.now();
+        return true;
+      }
+    } catch (_) {}
+
     this.isOnline = false;
     this.reconnectAttempts++;
     return false;
@@ -146,7 +155,7 @@ export class MarketDataLayerService {
     const symbols = Object.keys(DEFAULT_FALLBACK_PRICES);
     const wsTickersAvailable = symbols.every(sym => {
       const cached = this.lastTickers.get(`${marketType}_${sym}`);
-      return cached && (now - cached.localReceiveTime < 6000);
+      return cached && (now - cached.localReceiveTime < 8000);
     });
 
     if (wsTickersAvailable) {
@@ -168,60 +177,84 @@ export class MarketDataLayerService {
 
     try {
       this.lastRequestTime = now;
-      const res = await fetch(baseUrl, { signal: AbortSignal.timeout(4000) });
-      
-      if (res.status === 429) {
-        this.backoffUntil = now + 60000;
-        AuditLogger.error('MARKET_DATA', 'RATE_LIMIT_HIT', 'Binance 429 Rate limit hit, backing off 60s');
-        if (executionMode === 'LIVE') {
-          throw new Error('BINANCE_RATE_LIMIT_429');
+      let raw: any = null;
+
+      // 1. Primary: Server proxy (bypasses browser CORS restrictions)
+      try {
+        const proxyRes = await fetch(`/api/binance/tickers?marketType=${marketType}`, { signal: AbortSignal.timeout(6000) });
+        if (proxyRes.ok) {
+          const json = await proxyRes.json();
+          if (json.success && Array.isArray(json.data)) {
+            raw = json.data;
+          }
         }
+      } catch (_) {}
+
+      // 2. Direct fetch fallback
+      if (!raw) {
+        try {
+          const res = await fetch(baseUrl, { signal: AbortSignal.timeout(5000) });
+          if (res.status === 429) {
+            this.backoffUntil = now + 60000;
+            AuditLogger.error('MARKET_DATA', 'RATE_LIMIT_HIT', 'Binance 429 Rate limit hit, backing off 60s');
+            if (executionMode === 'LIVE') throw new Error('BINANCE_RATE_LIMIT_429');
+          }
+          if (res.ok) {
+            raw = await res.json();
+          }
+        } catch (_) {}
       }
 
-      if (res.ok) {
-        const raw = await res.json();
-        if (Array.isArray(raw)) {
-          const map = new Map<string, any>();
-          raw.forEach(item => map.set(item.symbol, item));
-
-          const result: Record<string, MarketTicker> = {};
-          const symbols = Object.keys(DEFAULT_FALLBACK_PRICES);
-
-          for (const sym of symbols) {
-            const item = map.get(sym);
-            if (item) {
-              const lastPrice = parseFloat(item.lastPrice || item.price || '0');
-              const bid = parseFloat(item.bidPrice || (lastPrice * 0.9998).toString());
-              const ask = parseFloat(item.askPrice || (lastPrice * 1.0002).toString());
-              const spreadPct = lastPrice > 0 ? ((ask - bid) / lastPrice) * 100 : 0.04;
-
-              const ticker: MarketTicker = {
-                symbol: sym,
-                marketType,
-                lastPrice,
-                bid,
-                ask,
-                spreadPct: Math.round(spreadPct * 1000) / 1000,
-                change24h: parseFloat(item.priceChangePercent || '0'),
-                high24h: parseFloat(item.highPrice || '0'),
-                low24h: parseFloat(item.lowPrice || '0'),
-                volume24h: parseFloat(item.quoteVolume || '0'),
-                exchangeTime: item.closeTime || now,
-                localReceiveTime: now,
-                dataSource: 'REAL_MARKET',
-                isStale: false
-              };
-              this.lastTickers.set(`${marketType}_${sym}`, ticker);
-              result[sym] = ticker;
-            }
+      // 3. Fallback to Spot direct
+      if (!raw && marketType === 'USDT_M_FUTURES') {
+        try {
+          const spotRes = await fetch('https://api.binance.com/api/v3/ticker/24hr', { signal: AbortSignal.timeout(5000) });
+          if (spotRes.ok) {
+            raw = await spotRes.json();
           }
+        } catch (_) {}
+      }
 
-          this.isOnline = true;
-          this.lastSuccessfulFetchTime = now;
-          this.reconnectAttempts = 0;
+      if (Array.isArray(raw)) {
+        const map = new Map<string, any>();
+        raw.forEach(item => map.set(item.symbol, item));
 
-          return result;
+        const result: Record<string, MarketTicker> = {};
+
+        for (const sym of symbols) {
+          const item = map.get(sym);
+          if (item) {
+            const lastPrice = parseFloat(item.lastPrice || item.price || '0');
+            const bid = parseFloat(item.bidPrice || (lastPrice * 0.9998).toString());
+            const ask = parseFloat(item.askPrice || (lastPrice * 1.0002).toString());
+            const spreadPct = lastPrice > 0 ? ((ask - bid) / lastPrice) * 100 : 0.04;
+
+            const ticker: MarketTicker = {
+              symbol: sym,
+              marketType,
+              lastPrice,
+              bid,
+              ask,
+              spreadPct: Math.round(spreadPct * 1000) / 1000,
+              change24h: parseFloat(item.priceChangePercent || '0'),
+              high24h: parseFloat(item.highPrice || '0'),
+              low24h: parseFloat(item.lowPrice || '0'),
+              volume24h: parseFloat(item.quoteVolume || '0'),
+              exchangeTime: item.closeTime || now,
+              localReceiveTime: now,
+              dataSource: 'REAL_MARKET',
+              isStale: false
+            };
+            this.lastTickers.set(`${marketType}_${sym}`, ticker);
+            result[sym] = ticker;
+          }
         }
+
+        this.isOnline = true;
+        this.lastSuccessfulFetchTime = now;
+        this.reconnectAttempts = 0;
+
+        return result;
       }
     } catch (err: any) {
       AuditLogger.warn('MARKET_DATA', 'FETCH_TICKERS_FAILED', `Failed to fetch tickers: ${err?.message || err}`);
@@ -281,6 +314,15 @@ export class MarketDataLayerService {
     marketType: MarketType = 'USDT_M_FUTURES',
     executionMode: 'PAPER' | 'LIVE' | 'SYNTHETIC' | 'BACKTEST' = 'PAPER'
   ): Promise<Candle[]> {
+    const cacheKey = `${symbol}_${timeframe}_${marketType}`;
+    const cachedEntry = this.candleCache.get(cacheKey);
+    const now = Date.now();
+
+    // Fast-path: Return cached real candles if fresh (< 15 seconds old)
+    if (cachedEntry && (now - cachedEntry.timestamp < 15000) && cachedEntry.candles.length >= Math.min(limit, 15)) {
+      return cachedEntry.candles;
+    }
+
     const tfInterval: Record<Timeframe, string> = {
       '1m': '1m',
       '5m': '5m',
@@ -292,42 +334,85 @@ export class MarketDataLayerService {
     };
 
     const interval = tfInterval[timeframe] || '15m';
-    const baseUrl = marketType === 'USDT_M_FUTURES'
-      ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
-      : `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+    let raw: any = null;
 
+    // 1. Primary: Server proxy (bypasses browser CORS & CloudFront limits)
     try {
-      const res = await fetch(baseUrl, { signal: AbortSignal.timeout(4000) });
-      if (res.ok) {
-        const raw = await res.json();
-        if (Array.isArray(raw) && raw.length > 0) {
-          const now = Date.now();
-          this.isOnline = true;
-          this.lastSuccessfulFetchTime = now;
-          this.reconnectAttempts = 0;
-
-          return raw.map((c: any) => {
-            const openTime = Number(c[0]);
-            const closeTime = Number(c[6]);
-            const isClosed = now >= closeTime;
-
-            return {
-              timestamp: openTime,
-              openTime,
-              closeTime,
-              open: parseFloat(c[1]),
-              high: parseFloat(c[2]),
-              low: parseFloat(c[3]),
-              close: parseFloat(c[4]),
-              volume: parseFloat(c[5]),
-              isClosed,
-              dataSource: 'REAL_MARKET'
-            };
-          });
+      const proxyRes = await fetch(
+        `/api/binance/klines?symbol=${symbol}&interval=${interval}&limit=${limit}&marketType=${marketType}`,
+        { signal: AbortSignal.timeout(6500) }
+      );
+      if (proxyRes.ok) {
+        const json = await proxyRes.json();
+        if (json.success && Array.isArray(json.data) && json.data.length > 0) {
+          raw = json.data;
         }
       }
-    } catch (e: any) {
-      AuditLogger.warn('MARKET_DATA', 'KLINES_FAILED', `Failed to fetch real klines for ${symbol} ${timeframe}: ${e?.message}`);
+    } catch (_) {}
+
+    // 2. Direct fetch fallback
+    if (!raw) {
+      try {
+        const baseUrl = marketType === 'USDT_M_FUTURES'
+          ? `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+          : `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        const res = await fetch(baseUrl, { signal: AbortSignal.timeout(5000) });
+        if (res.ok) {
+          const directData = await res.json();
+          if (Array.isArray(directData) && directData.length > 0) {
+            raw = directData;
+          }
+        }
+      } catch (e: any) {
+        AuditLogger.warn('MARKET_DATA', 'KLINES_FAILED', `Direct fetch failed for ${symbol} ${timeframe}: ${e?.message}`);
+      }
+    }
+
+    // 3. Fallback to Spot direct
+    if (!raw && marketType === 'USDT_M_FUTURES') {
+      try {
+        const spotUrl = `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`;
+        const spotRes = await fetch(spotUrl, { signal: AbortSignal.timeout(5000) });
+        if (spotRes.ok) {
+          const spotData = await spotRes.json();
+          if (Array.isArray(spotData) && spotData.length > 0) {
+            raw = spotData;
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (Array.isArray(raw) && raw.length > 0) {
+      this.isOnline = true;
+      this.lastSuccessfulFetchTime = now;
+      this.reconnectAttempts = 0;
+
+      const candles: Candle[] = raw.map((c: any) => {
+        const openTime = Number(c[0]);
+        const closeTime = Number(c[6]);
+        const isClosed = now >= closeTime;
+
+        return {
+          timestamp: openTime,
+          openTime,
+          closeTime,
+          open: parseFloat(c[1]),
+          high: parseFloat(c[2]),
+          low: parseFloat(c[3]),
+          close: parseFloat(c[4]),
+          volume: parseFloat(c[5]),
+          isClosed,
+          dataSource: 'REAL_MARKET'
+        };
+      });
+
+      this.candleCache.set(cacheKey, { candles, timestamp: now });
+      return candles;
+    }
+
+    // If fetch failed but we have cached candles younger than 90s, use them to avoid false disconnections
+    if (cachedEntry && (now - cachedEntry.timestamp < 90000) && cachedEntry.candles.length > 0) {
+      return cachedEntry.candles;
     }
 
     // In LIVE or PAPER mode: STRICTLY NEVER RETURN SYNTHETIC CANDLES! Return empty and block decisions.
