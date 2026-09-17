@@ -364,7 +364,19 @@ wss.on("connection", (ws) => {
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        watch: {
+          ignored: [
+            "**/data/**",
+            "**/data/**/*",
+            "**/data/memory.json",
+            "**/*.json",
+            "**/logs/**",
+            /[/\\]data[/\\]/,
+          ],
+        },
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);
