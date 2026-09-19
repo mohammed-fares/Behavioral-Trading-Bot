@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { MarketDataLayer, MarketTicker } from '../services/marketData/marketDataLayer';
 import { BehaviorEngine } from '../services/behaviorEngine';
 import { RiskEngine } from '../services/risk/riskEngine';
@@ -47,13 +47,16 @@ export function useBehavioralScanner({
   showToast,
 }: UseBehavioralScannerProps) {
   const [isScanningNow, setIsScanningNow] = useState<boolean>(false);
+  const isScanningRef = useRef<boolean>(false);
 
   const runBehavioralScan = useCallback(async (targetCoin?: string) => {
+    if (isScanningRef.current) return;
     if (isConnectionLost || (typeof navigator !== 'undefined' && !navigator.onLine)) {
       AuditLogger.warn('STRATEGY', 'SCAN_BLOCKED_DISCONNECTED', 'محاولة مسح ملغاة: تم إيقاف البوت بسبب انقطاع الاتصال لحظر البيانات الوهمية.');
       return;
     }
 
+    isScanningRef.current = true;
     setIsScanningNow(true);
     const coinsToScan = targetCoin ? [targetCoin] : SUPPORTED_COINS.map(c => c.symbol);
 
@@ -213,7 +216,11 @@ export function useBehavioralScanner({
               );
 
               if (execResult.success && execResult.trade) {
-                const newTrade = execResult.trade;
+                const newTrade = {
+                  ...execResult.trade,
+                  highProbabilitySetup: decision.highProbabilitySetup,
+                  confluenceScore: decision.confluenceScore,
+                };
                 setActiveTrades(prev => {
                   const updated = [newTrade, ...prev];
                   StorageService.saveActiveTrades(updated);
@@ -236,7 +243,8 @@ export function useBehavioralScanner({
           }
 
           setDecisionLogs(prev => {
-            const updated = [decision, ...prev.slice(0, 99)];
+            const filteredPrev = prev.filter(d => d.id !== decision.id);
+            const updated = [decision, ...filteredPrev].slice(0, 100);
             StorageService.saveDecisionLogs(updated);
             return updated;
           });
@@ -245,6 +253,7 @@ export function useBehavioralScanner({
     } catch (err) {
       console.error('Scan error:', err);
     } finally {
+      isScanningRef.current = false;
       setIsScanningNow(false);
     }
   }, [tickers, settings, patterns, activeTrades, closedTrades, stats, disqualifiedPatterns, isConnectionLost, setActiveTrades, setDecisionLogs, showToast]);

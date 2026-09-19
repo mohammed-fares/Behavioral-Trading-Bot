@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { StorageService } from '../services/storage';
 import { BinanceService, TickerData } from '../services/binance';
 import { HourlyReporter } from '../services/hourlyReporter';
@@ -228,19 +228,22 @@ export function useTradingBot() {
     return () => clearInterval(interval);
   }, [isConnectionLost, setIsConnectionLost, setReconnectCount, showToast]);
 
+  const scanRef = useRef(runBehavioralScan);
+  scanRef.current = runBehavioralScan;
+
   // 2. Continuous Scan Interval
   useEffect(() => {
     if (!isAutoScanning || isConnectionLost) return;
 
     const timeout = setTimeout(() => {
       if (!isConnectionLost) {
-        runBehavioralScan();
+        scanRef.current();
       }
     }, 1500);
 
     const interval = setInterval(() => {
       if (!isConnectionLost) {
-        runBehavioralScan();
+        scanRef.current();
       }
     }, 16000);
 
@@ -248,7 +251,7 @@ export function useTradingBot() {
       clearTimeout(timeout);
       clearInterval(interval);
     };
-  }, [isAutoScanning, isConnectionLost, runBehavioralScan]);
+  }, [isAutoScanning, isConnectionLost]);
 
   // 3. Automated Hourly Reporting
   useEffect(() => {
@@ -274,7 +277,12 @@ export function useTradingBot() {
   const handleApplyScenario = (scenarioId: number) => {
     const res = executeScenario(scenarioId, stats);
     if (res.decision) {
-      setDecisionLogs(prev => [res.decision!, ...prev]);
+      setDecisionLogs(prev => {
+        const filtered = prev.filter(d => d.id !== res.decision!.id);
+        const next = [res.decision!, ...filtered].slice(0, 100);
+        StorageService.saveDecisionLogs(next);
+        return next;
+      });
     }
     if (res.trade) {
       setClosedTrades(prev => [res.trade!, ...prev]);

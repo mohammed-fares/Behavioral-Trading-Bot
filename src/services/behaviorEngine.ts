@@ -181,19 +181,19 @@ export const BehaviorEngine = {
     const reasons: string[] = [];
     const reviewSteps: DecisionStepReview[] = [];
 
-    // Filter 1: Volume Confirmation
+    // Filter 1: Volume Confirmation (Institutional order flow)
     let volumePassed = true;
     if (candles && candles.length >= 20) {
-      volumePassed = hasVolumeConfirmation(candles, 1.5);
+      volumePassed = hasVolumeConfirmation(candles, 1.2);
       reviewSteps.push({
-        name: 'فحص تأكيد الحجم (Volume Confirmation)',
+        name: 'فحص تأكيد الحجم والسيولة (Volume Surge)',
         passed: volumePassed,
         detail: volumePassed 
-          ? 'حجم الشمعة الأخيرة أعلى من 1.5x متوسط الـ 20 شمعة السابقة'
-          : 'حجم الشمعة الأخيرة أقل من 1.5x متوسط الـ 20 شمعة السابقة (NO_VOLUME_CONFIRMATION)',
-        threshold: '> 1.5x المتوسط'
+          ? 'حجم الشمعة الأخيرة مدعوم بتدفق سيولة يتجاوز 1.2x متوسط الـ 20 شمعة السابقة'
+          : 'حجم الشمعة الأخيرة أقل من 1.2x متوسط الـ 20 شمعة السابقة (NO_VOLUME_CONFIRMATION)',
+        threshold: '> 1.2x المتوسط'
       });
-      if (!volumePassed) reasons.push('عدم وجود تأكيد كافٍ من حجم التداول (NO_VOLUME_CONFIRMATION)');
+      if (!volumePassed) reasons.push('عدم وجود تدفق كافٍ في حجم التداول (NO_VOLUME_CONFIRMATION)');
     }
 
     // Filter 2: RSI Zone [40, 70]
@@ -471,6 +471,24 @@ export const BehaviorEngine = {
     // Final Confidence Calculation
     const finalConfidence = Math.max(10, Math.min(99, alignment.adjustedConfidence + hourBonus));
 
+    // High-Probability Confluence Scoring (نظام التلاقي السلوكي لاستخراج صفقات عالية النجاح)
+    const patternEdge = pattern ? Math.min(100, Math.max(0, pattern.continuationRate || initialConfidence)) : 50;
+    const mtfScore = Math.min(100, Math.round((alignment.supportingCount / 7) * 100));
+    const volumeScore = volumePassed ? 90 : 50;
+    const rsiScore = rsiPassed ? 85 : 45;
+    const confluenceScore = Math.round(patternEdge * 0.35 + mtfScore * 0.35 + volumeScore * 0.15 + rsiScore * 0.15);
+    const isHighProbabilitySetup = (finalConfidence >= 70) && (alignment.supportingCount >= 4) && (confluenceScore >= 72);
+
+    reviewSteps.push({
+      name: 'محرك التلاقي السلوكي للصفقات عالية النجاح (Confluence Engine)',
+      passed: isHighProbabilitySetup,
+      detail: isHighProbabilitySetup 
+        ? `⭐ صفقة ذهبية عالية النجاح بنسبة تلاقي ${confluenceScore}%: تأكيد متكامل بين النمط (${patternEdge}%) والتوافق الزمني (${mtfScore}%) والزخم والسيولة.`
+        : `درجة التلاقي السلوكي: ${confluenceScore}% (صفقة اعتيادية، الحد المستهدف للفرص الذهبية ≥ 72%)`,
+      metric: `${confluenceScore}% HPS`,
+      threshold: '≥ 72% للفرص الذهبية',
+    });
+
     // Decision Status Determination
     let status: 'APPROVED' | 'REJECTED' | 'WAIT' = 'REJECTED';
     const minConfThresh = settings.minConfidence || 55;
@@ -478,7 +496,11 @@ export const BehaviorEngine = {
 
     if (patternPassed && alignmentPassed && hourPassed && tradesPassed && riskPassed && antiRepetitionPassed && technicalFiltersPassed && regimePassed && symbolPerfPassed && finalConfidence >= minConfThresh) {
       status = 'APPROVED';
-      reasons.unshift(`المعايير مكتملة بنجاح: ثقة نهائية ${finalConfidence}% مع توافق ${alignment.supportingCount}/7 أطر`);
+      if (isHighProbabilitySetup) {
+        reasons.unshift(`⭐ صفقة عالية النجاح (Confluence: ${confluenceScore}%): تلاقي ثلاثي فائق الجودة بين النمط السلوكي والاتجاه الكلي وحجم التداول`);
+      } else {
+        reasons.unshift(`المعايير مكتملة بنجاح: ثقة نهائية ${finalConfidence}% مع توافق ${alignment.supportingCount}/7 أطر`);
+      }
     } else if (!antiRepetitionPassed) {
       status = 'REJECTED';
       // reason already added in anti-repetition step
@@ -493,14 +515,16 @@ export const BehaviorEngine = {
     // Proposed trade parameters (Phase 5: Execution formula)
     let proposedTrade = undefined;
     if (status === 'APPROVED' || status === 'WAIT') {
-      const avgMove = pattern ? pattern.avgSubsequentMovePct : 1.0;
-      const avgDur = pattern ? pattern.avgSubsequentDuration : 45;
-      const targetPct = Number((avgMove * 0.8).toFixed(2));
-      const stopLossPct = Number((avgMove * 0.5).toFixed(2));
+      const avgMove = pattern ? pattern.avgSubsequentMovePct : 1.4;
+      const avgDur = pattern ? pattern.avgSubsequentDuration : 60;
+      // High probability trades target favorable 1:2 Risk to Reward
+      const targetPct = isHighProbabilitySetup ? Number((avgMove * 1.0).toFixed(2)) : Number((avgMove * 0.8).toFixed(2));
+      const stopLossPct = isHighProbabilitySetup ? Number((avgMove * 0.5).toFixed(2)) : Number((avgMove * 0.55).toFixed(2));
 
       const maxPerTradeUsd = (stats.balance * (settings.positionSizePct / 100)) * settings.leverage;
       const alignmentFactor = alignment.supportingCount / 7;
-      const sizeUsd = Math.round((finalConfidence / 100) * maxPerTradeUsd * alignmentFactor * 1.2 * regimeSizeMultiplier);
+      const sizeMultiplier = isHighProbabilitySetup ? 1.3 : 1.0;
+      const sizeUsd = Math.round((finalConfidence / 100) * maxPerTradeUsd * alignmentFactor * 1.2 * regimeSizeMultiplier * sizeMultiplier);
 
       const isLong = alignment.finalDirection === 'UP';
       const targetPrice = isLong 
@@ -527,8 +551,12 @@ export const BehaviorEngine = {
       pattern ? pattern.continuedCount : 0
     );
 
+    const randEntropy = typeof crypto !== 'undefined' && crypto.randomUUID 
+      ? crypto.randomUUID().slice(0, 8) 
+      : `${Math.random().toString(36).slice(2, 8)}-${Math.floor(Math.random() * 100000)}`;
+
     return {
-      id: `dec-${now}-${Math.floor(Math.random() * 1000)}`,
+      id: `dec-${now}-${coin.toLowerCase()}-${randEntropy}`,
       timestamp: now,
       coin,
       baseTimeframe,
@@ -542,6 +570,8 @@ export const BehaviorEngine = {
       similarity,
       dataSource,
       marketRegime: currentRegime,
+      highProbabilitySetup: isHighProbabilitySetup,
+      confluenceScore,
       supportingCount: alignment.supportingCount,
       opposingCount: alignment.opposingCount,
       reasons,

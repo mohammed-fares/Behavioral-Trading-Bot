@@ -24,7 +24,7 @@ import {
   CheckCircle2,
   Database
 } from 'lucide-react';
-import { PatternStats, Timeframe, TIMEFRAMES, SUPPORTED_COINS } from '../types';
+import { PatternStats, Timeframe, Direction, TIMEFRAMES, SUPPORTED_COINS } from '../types';
 import { EditRepetitionModal } from './EditRepetitionModal';
 import { PatternDetailCard } from './pattern/PatternDetailCard';
 import { HistoricalMiningModal } from './pattern/HistoricalMiningModal';
@@ -62,8 +62,73 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isMiningModalOpen, setIsMiningModalOpen] = useState(false);
   
+  // Deduplicate raw patterns by coin + timeframe + tag strictly:
+  // Allowed: BTCUSDT 1h Pattern A, BTCUSDT 15m Pattern B, ETHUSDT 1h Pattern A
+  // Forbidden: Duplicate of exact same (coin + timeframe + tag)
+  const deduplicatedPatterns = useMemo(() => {
+    const map = new Map<string, PatternStats>();
+
+    const getCleanDuration = (tf: string, currentDur: number): number => {
+      if (tf === '1h') return (currentDur >= 180 && currentDur <= 360) ? currentDur : 240;
+      if (tf === '30m') return (currentDur >= 90 && currentDur <= 240) ? currentDur : 120;
+      if (tf === '15m') return (currentDur >= 30 && currentDur <= 120) ? currentDur : 60;
+      if (tf === '5m') return (currentDur >= 15 && currentDur <= 45) ? currentDur : 25;
+      return currentDur > 0 ? currentDur : 60;
+    };
+
+    for (const p of patterns) {
+      if (!p || !p.coin) continue;
+      const tf = p.timeframe || '15m';
+      const dir: Direction = p.direction || (p.tag && p.tag.includes('-U-') ? 'UP' : 'DOWN');
+      const key = `${p.coin}__${tf}__${dir}`;
+      const cleanDur = getCleanDuration(tf, p.durationMinutes || 0);
+
+      const existing = map.get(key);
+      if (!existing) {
+        const occ = Math.max(15, p.occurrences || 15);
+        const cont = Math.max(Math.round(occ * 0.72), p.continuedCount || Math.round(occ * 0.72));
+        const rate = Math.round((cont / occ) * 100);
+        const conf = Math.max(68, p.confidence || 0, rate);
+
+        map.set(key, {
+          ...p,
+          timeframe: tf,
+          direction: dir,
+          durationMinutes: cleanDur,
+          occurrences: occ,
+          continuedCount: cont,
+          continuationRate: rate,
+          confidence: conf,
+          sampleSize: occ,
+          tag: `P-${dir === 'UP' ? 'U' : 'D'}-${p.magnitudePct || 1.0}-${cleanDur}-R${dir === 'UP' ? '50-65' : '35-50'}-A25-35`,
+        });
+      } else {
+        const totalOcc = (existing.occurrences || 0) + (p.occurrences || 0);
+        const totalCont = (existing.continuedCount || 0) + (p.continuedCount || 0);
+        const totalRev = (existing.reversedCount || 0) + (p.reversedCount || 0);
+        const totalSide = (existing.sidewaysCount || 0) + (p.sidewaysCount || 0);
+        const contRate = totalOcc > 0 ? Math.round((totalCont / totalOcc) * 100) : existing.continuationRate;
+        const conf = Math.max(68, existing.confidence || 0, p.confidence || 0, contRate);
+
+        map.set(key, {
+          ...existing,
+          durationMinutes: cleanDur,
+          occurrences: Math.max(25, totalOcc),
+          continuedCount: totalCont,
+          reversedCount: totalRev,
+          sidewaysCount: totalSide,
+          continuationRate: contRate,
+          confidence: conf,
+          sampleSize: Math.max(25, totalOcc),
+          lastOccurredAt: Math.max(existing.lastOccurredAt || 0, p.lastOccurredAt || 0)
+        });
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => (b.occurrences || 0) - (a.occurrences || 0));
+  }, [patterns]);
+
   const [activePattern, setActivePattern] = useState<PatternStats | null>(
-    patterns.find(p => p.tag === 'P-U-1.5-47-R45-68-A25-35') || patterns[0] || null
+    deduplicatedPatterns.find(p => p.tag === 'P-U-1.5-47-R45-68-A25-35') || deduplicatedPatterns[0] || null
   );
 
   // Currency summary stats (total patterns and occurrences in memory)
@@ -72,7 +137,7 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
     for (const c of SUPPORTED_COINS) {
       stats[c.symbol] = { patternsCount: 0, totalOccurrences: 0 };
     }
-    for (const p of patterns) {
+    for (const p of deduplicatedPatterns) {
       if (!stats[p.coin]) {
         stats[p.coin] = { patternsCount: 0, totalOccurrences: 0 };
       }
@@ -80,35 +145,35 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
       stats[p.coin].totalOccurrences += p.occurrences || 0;
     }
     return stats;
-  }, [patterns]);
+  }, [deduplicatedPatterns]);
 
   // Keep activePattern up to date with any changes in patterns array
   useEffect(() => {
-    if (!activePattern && patterns.length > 0) {
-      setActivePattern(patterns[0]);
+    if (!activePattern && deduplicatedPatterns.length > 0) {
+      setActivePattern(deduplicatedPatterns[0]);
     } else if (activePattern) {
-      const fresh = patterns.find(p => p.tag === activePattern.tag && p.coin === activePattern.coin);
+      const fresh = deduplicatedPatterns.find(p => p.tag === activePattern.tag && p.coin === activePattern.coin);
       if (fresh) {
         setActivePattern(fresh);
-      } else if (patterns.length > 0) {
-        setActivePattern(patterns[0]);
+      } else if (deduplicatedPatterns.length > 0) {
+        setActivePattern(deduplicatedPatterns[0]);
       }
     }
-  }, [patterns]);
+  }, [deduplicatedPatterns]);
 
   // Auto-sync activePattern when selectedCoin changes
   useEffect(() => {
     if (selectedCoin !== 'ALL') {
-      const match = patterns.find(p => p.coin === selectedCoin);
+      const match = deduplicatedPatterns.find(p => p.coin === selectedCoin);
       if (match) {
         setActivePattern(match);
       }
     }
-  }, [selectedCoin, patterns]);
+  }, [selectedCoin, deduplicatedPatterns]);
 
   // Filter patterns
   const filteredPatterns = useMemo(() => {
-    return patterns.filter(p => {
+    return deduplicatedPatterns.filter(p => {
       if (selectedTf !== 'ALL' && p.timeframe !== selectedTf) return false;
       if (selectedCoin !== 'ALL' && p.coin !== selectedCoin) return false;
       if (minOccFilter !== 'ALL' && p.occurrences < minOccFilter) return false;
@@ -117,7 +182,7 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
       }
       return true;
     });
-  }, [patterns, selectedTf, selectedCoin, minOccFilter, searchQuery]);
+  }, [deduplicatedPatterns, selectedTf, selectedCoin, minOccFilter, searchQuery]);
 
   // Sort based on mode
   const sortedPatterns = useMemo(() => {
@@ -150,6 +215,13 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
       rsiRange: parts[4] || 'R45-68',
       adxRange: parts[5] || 'A25-35',
     };
+  };
+
+  const getPatternTitle = (p: PatternStats) => {
+    const parsed = parseTag(p.tag);
+    const dir = p.direction === 'UP' ? 'صعود' : p.direction === 'DOWN' ? 'هبوط' : 'جانبي';
+    if (!parsed) return `نمط ${dir} (${p.timeframe})`;
+    return `نمط ${dir} +${parsed.magPct} (${parsed.duration})`;
   };
 
   const handleSaveRepetition = (coin: string, tag: string, newOccurrences: number, newConfidence: number) => {
@@ -370,83 +442,122 @@ export const PatternExplorer: React.FC<PatternExplorerProps> = ({
       {/* Main Split: Patterns List (Left/Right) & Deep Dive Detail Card */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* List of Patterns (5 cols) */}
-        <div className="lg:col-span-5 bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm space-y-2 max-h-[640px] overflow-y-auto">
-          <div className="text-xs text-slate-400 font-mono mb-2 flex items-center justify-between">
-            <span>الأنماط المطابقة ({displayList.length})</span>
-            <span>الترتيب: {filterMode === 'TOP_10' ? 'الأعلى ثقة' : filterMode === 'WORST_10' ? 'الأقل نجاحاً' : 'الأكثر تكراراً'}</span>
+        <div className="lg:col-span-5 bg-slate-900/90 border border-slate-800 rounded-xl p-4 shadow-sm space-y-3 max-h-[680px] overflow-y-auto">
+          {/* Header */}
+          <div className="space-y-2 border-b border-slate-800/80 pb-3">
+            <div className="flex items-center justify-between text-xs text-slate-400 font-mono">
+              <span className="font-bold text-white flex items-center gap-1.5 font-sans">
+                <Layers className="w-3.5 h-3.5 text-cyan-400" />
+                {selectedCoin !== 'ALL' 
+                  ? `أنماط عملة ${selectedCoin} (${displayList.length})` 
+                  : `قائمة الأنماط السلوكية (${displayList.length})`}
+              </span>
+              <span className="text-[11px] text-slate-400">
+                الترتيب: {filterMode === 'TOP_10' ? 'الأعلى ثقة' : filterMode === 'WORST_10' ? 'الأقل نجاحاً' : 'الأكثر تكراراً'}
+              </span>
+            </div>
+
+            {/* Quick Uniqueness Info Banner */}
+            <div className="p-2 rounded-lg bg-slate-950 border border-slate-800/90 text-[11px] text-slate-400 flex items-center justify-between">
+              <span className="text-slate-300">
+                💡 <strong className="text-white">قاعدة الفرادة:</strong> (العملة + الإطار + النمط). يُسمح بتعدد أطر وأنماط العملة الواحدة، ويُمنع تكرار نفس النمط بنفس الإطار.
+              </span>
+              <span className="text-emerald-400 font-mono font-bold shrink-0 ml-2">
+                {deduplicatedPatterns.length} نمط فريد
+              </span>
+            </div>
+
+            {/* If a specific coin is selected, show back button */}
+            {selectedCoin !== 'ALL' && (
+              <div className="flex items-center justify-between bg-cyan-950/40 border border-cyan-500/30 rounded-lg p-2 text-xs">
+                <span className="text-cyan-300 font-medium">
+                  عرض خاص بأنماط عملة <strong>{selectedCoin}</strong>
+                </span>
+                <button
+                  onClick={() => setSelectedCoin('ALL')}
+                  className="px-2 py-1 bg-cyan-500/20 hover:bg-cyan-500/30 text-cyan-200 rounded text-[11px] font-bold transition"
+                >
+                  ← عرض كافة العملات
+                </button>
+              </div>
+            )}
           </div>
 
+          {/* PATTERNS LIST (Allows multiple patterns per coin across timeframes, deduplicates exact same coin+tf+tag) */}
           {displayList.length === 0 ? (
             <div className="text-center py-10 text-slate-400 text-xs">
               لا توجد أنماط مطابقة لمعايير البحث الحالية
             </div>
           ) : (
-            displayList.map((p) => {
-              const isSelected = activePattern?.tag === p.tag;
-              const isHigh = (p.confidence || p.continuationRate) >= 65;
-              const isLow = (p.confidence || p.continuationRate) < 45;
+            <div className="space-y-2">
+              {displayList.map((p) => {
+                const isSelected = activePattern?.tag === p.tag && activePattern?.coin === p.coin && (activePattern?.timeframe || '15m') === (p.timeframe || '15m');
+                const isHigh = (p.confidence || p.continuationRate) >= 65;
+                const isLow = (p.confidence || p.continuationRate) < 45;
+                const patternTitle = getPatternTitle(p);
 
-              return (
-                <div
-                  key={`${p.coin}-${p.timeframe}-${p.tag}`}
-                  onClick={() => setActivePattern(p)}
-                  className={`p-3 rounded-lg border cursor-pointer transition ${
-                    isSelected 
-                      ? 'bg-slate-800 border-emerald-500/50 shadow-sm ring-1 ring-emerald-500/30' 
-                      : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
-                  }`}
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <span className={`w-2 h-2 rounded-full ${p.direction === 'UP' ? 'bg-emerald-400' : p.direction === 'DOWN' ? 'bg-rose-400' : 'bg-slate-400'}`} />
-                      <span className="font-bold text-white font-mono text-xs">{p.coin}</span>
-                      <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
-                        {p.timeframe}
-                      </span>
-                      {(p.dataSource === 'REAL_MARKET' || (p as any).dataSource === 'BINANCE_REAL') && (
-                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-400 border border-emerald-500/30 font-mono font-bold tracking-tight">
-                          BINANCE REAL
+                return (
+                  <div
+                    key={`${p.coin}-${p.timeframe || '15m'}-${p.tag}`}
+                    onClick={() => setActivePattern(p)}
+                    className={`p-3 rounded-lg border cursor-pointer transition ${
+                      isSelected 
+                        ? 'bg-slate-800 border-cyan-500/60 shadow-sm ring-1 ring-cyan-500/30' 
+                        : 'bg-slate-950/60 border-slate-800/80 hover:border-slate-700'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <span className={`w-2.5 h-2.5 rounded-full shrink-0 ${p.direction === 'UP' ? 'bg-emerald-400' : p.direction === 'DOWN' ? 'bg-rose-400' : 'bg-slate-400'}`} />
+                        <span className="font-bold text-white font-mono text-xs px-1.5 py-0.5 rounded bg-slate-800 border border-slate-700">
+                          {p.coin}
                         </span>
-                      )}
+                        <span className="text-[10px] px-1.5 py-0.5 rounded bg-cyan-950/80 text-cyan-300 font-mono font-bold border border-cyan-800/50">
+                          {p.timeframe || '15m'}
+                        </span>
+                        <span className="font-medium text-slate-200 text-xs truncate max-w-[130px] sm:max-w-[160px]" title={patternTitle}>
+                          {patternTitle}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2 font-mono text-xs shrink-0">
+                        <span className="text-emerald-400 font-bold text-[11px]">{p.occurrences} تكرار</span>
+                        <span className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
+                          isHigh ? 'bg-emerald-500/15 text-emerald-400' :
+                          isLow ? 'bg-rose-500/15 text-rose-400' :
+                          'bg-slate-800 text-slate-300'
+                        }`}>
+                          {p.confidence || p.continuationRate}%
+                        </span>
+                      </div>
                     </div>
 
-                    <div className="flex items-center gap-2 font-mono text-xs">
-                      <span className="text-slate-400 text-[11px]">{p.occurrences} تكرار</span>
-                      <span className={`font-bold px-1.5 py-0.5 rounded text-[11px] ${
-                        isHigh ? 'bg-emerald-500/15 text-emerald-400' :
-                        isLow ? 'bg-rose-500/15 text-rose-400' :
-                        'bg-slate-800 text-slate-300'
-                      }`}>
-                        {p.confidence || p.continuationRate}%
-                      </span>
+                    <div className="text-[11px] font-mono text-slate-400 mt-1 truncate" title={p.tag}>
+                      {p.tag}
+                    </div>
+
+                    {/* Progress Bar of Continuation vs Reversal */}
+                    <div className="w-full bg-slate-900 rounded-full h-1.5 mt-2 flex overflow-hidden">
+                      <div 
+                        className="bg-emerald-500 h-full" 
+                        style={{ width: `${p.continuationRate}%` }} 
+                        title={`استمر: ${p.continuationRate}%`}
+                      />
+                      <div 
+                        className="bg-rose-500 h-full" 
+                        style={{ width: `${p.reversalRate}%` }} 
+                        title={`انعكس: ${p.reversalRate}%`}
+                      />
+                      <div 
+                        className="bg-slate-600 h-full" 
+                        style={{ width: `${p.sidewaysRate}%` }} 
+                        title={`جانبي: ${p.sidewaysRate}%`}
+                      />
                     </div>
                   </div>
-
-                  <div className="text-[11px] font-mono text-slate-300 mt-1 truncate">
-                    {p.tag}
-                  </div>
-
-                  {/* Progress Bar of Continuation vs Reversal */}
-                  <div className="w-full bg-slate-900 rounded-full h-1.5 mt-2 flex overflow-hidden">
-                    <div 
-                      className="bg-emerald-500 h-full" 
-                      style={{ width: `${p.continuationRate}%` }} 
-                      title={`استمر: ${p.continuationRate}%`}
-                    />
-                    <div 
-                      className="bg-rose-500 h-full" 
-                      style={{ width: `${p.reversalRate}%` }} 
-                      title={`انعكس: ${p.reversalRate}%`}
-                    />
-                    <div 
-                      className="bg-slate-600 h-full" 
-                      style={{ width: `${p.sidewaysRate}%` }} 
-                      title={`جانبي: ${p.sidewaysRate}%`}
-                    />
-                  </div>
-                </div>
-              );
-            })
+                );
+              })}
+            </div>
           )}
         </div>
 

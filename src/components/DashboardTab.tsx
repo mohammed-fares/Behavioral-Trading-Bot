@@ -125,11 +125,14 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
 
   // De-duplicate recent decisions
   const uniqueRecentDecisions = useMemo(() => {
-    const seen = new Set<string>();
+    const seenPattern = new Set<string>();
+    const seenId = new Set<string>();
     return recentDecisions.filter(d => {
+      if (!d || !d.id || seenId.has(d.id)) return false;
+      seenId.add(d.id);
       const key = `${d.coin}-${d.baseTimeframe}-${d.patternTag || 'none'}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
+      if (seenPattern.has(key)) return false;
+      seenPattern.add(key);
       return true;
     });
   }, [recentDecisions]);
@@ -236,13 +239,13 @@ export const DashboardTab: React.FC<DashboardTabProps> = ({
             </div>
 
             <div className="space-y-2.5">
-              {uniqueRecentDecisions.slice(0, 4).map((dec) => {
+              {uniqueRecentDecisions.slice(0, 4).map((dec, idx) => {
                 const isApproved = dec.status === 'APPROVED';
                 const isRejected = dec.status === 'REJECTED';
 
                 return (
                   <div 
-                    key={dec.id}
+                    key={`${dec.id || 'dec'}-${idx}`}
                     onClick={() => onViewDecision(dec)}
                     className="p-3 rounded-lg bg-slate-950/60 border border-slate-800/80 hover:border-slate-700 transition cursor-pointer"
                   >

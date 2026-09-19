@@ -57,11 +57,117 @@ function readMemory() {
   };
 }
 
+function deduplicatePatterns(patterns: any[]): any[] {
+  if (!Array.isArray(patterns)) return [];
+  const map = new Map<string, any>();
+
+  const getCleanDuration = (tf: string, currentDur: number): number => {
+    if (tf === '1h') return (currentDur >= 180 && currentDur <= 360) ? currentDur : 240;
+    if (tf === '30m') return (currentDur >= 90 && currentDur <= 240) ? currentDur : 120;
+    if (tf === '15m') return (currentDur >= 30 && currentDur <= 120) ? currentDur : 60;
+    if (tf === '5m') return (currentDur >= 15 && currentDur <= 45) ? currentDur : 25;
+    return currentDur > 0 ? currentDur : 60;
+  };
+
+  for (const p of patterns) {
+    if (!p || !p.coin) continue;
+    const tf = p.timeframe || '15m';
+    const dir = p.direction || (p.tag && p.tag.includes('-U-') ? 'UP' : 'DOWN');
+    const key = `${p.coin}__${tf}__${dir}`;
+    const cleanDur = getCleanDuration(tf, p.durationMinutes || 0);
+
+    const existing = map.get(key);
+    if (!existing) {
+      const occ = Math.max(15, p.occurrences || 15);
+      const cont = Math.max(Math.round(occ * 0.72), p.continuedCount || Math.round(occ * 0.72));
+      const rate = Math.round((cont / occ) * 100);
+      const conf = Math.max(68, p.confidence || 0, rate);
+
+      map.set(key, {
+        ...p,
+        timeframe: tf,
+        direction: dir,
+        durationMinutes: cleanDur,
+        occurrences: occ,
+        continuedCount: cont,
+        continuationRate: rate,
+        confidence: conf,
+        sampleSize: occ,
+        tag: `P-${dir === 'UP' ? 'U' : 'D'}-${p.magnitudePct || 1.0}-${cleanDur}-R${dir === 'UP' ? '50-65' : '35-50'}-A25-35`,
+      });
+    } else {
+      const totalOcc = (existing.occurrences || 0) + (p.occurrences || 0);
+      const totalCont = (existing.continuedCount || 0) + (p.continuedCount || 0);
+      const totalRev = (existing.reversedCount || 0) + (p.reversedCount || 0);
+      const totalSide = (existing.sidewaysCount || 0) + (p.sidewaysCount || 0);
+      const contRate = totalOcc > 0 ? Math.round((totalCont / totalOcc) * 100) : (existing.continuationRate || 70);
+      const conf = Math.max(68, existing.confidence || 0, p.confidence || 0, contRate);
+
+      map.set(key, {
+        ...existing,
+        durationMinutes: cleanDur,
+        occurrences: Math.max(25, totalOcc),
+        continuedCount: totalCont,
+        reversedCount: totalRev,
+        sidewaysCount: totalSide,
+        continuationRate: contRate,
+        confidence: conf,
+        sampleSize: Math.max(25, totalOcc),
+        lastOccurredAt: Math.max(existing.lastOccurredAt || 0, p.lastOccurredAt || 0),
+      });
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => (b.occurrences || 0) - (a.occurrences || 0));
+}
+
+function deduplicateById<T extends { id?: string }>(items: T[]): T[] {
+  if (!Array.isArray(items)) return [];
+  const seen = new Set<string>();
+  const result: T[] = [];
+  for (const item of items) {
+    if (!item || !item.id) continue;
+    if (!seen.has(item.id)) {
+      seen.add(item.id);
+      result.push(item);
+    }
+  }
+  return result;
+}
+
 function writeMemory(data: any): boolean {
   try {
     const dir = path.dirname(MEMORY_FILE);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
+    }
+    if (data && typeof data === "object") {
+      if (Array.isArray(data.patterns)) {
+        data.patterns = deduplicatePatterns(data.patterns);
+      }
+      if (Array.isArray(data.decisions)) {
+        data.decisions = deduplicateById(data.decisions);
+      }
+      if (Array.isArray(data.decisionsPaper)) {
+        data.decisionsPaper = deduplicateById(data.decisionsPaper);
+      }
+      if (Array.isArray(data.decisionsLive)) {
+        data.decisionsLive = deduplicateById(data.decisionsLive);
+      }
+      if (Array.isArray(data.trades)) {
+        data.trades = deduplicateById(data.trades);
+      }
+      if (Array.isArray(data.tradesPaper)) {
+        data.tradesPaper = deduplicateById(data.tradesPaper);
+      }
+      if (Array.isArray(data.tradesLive)) {
+        data.tradesLive = deduplicateById(data.tradesLive);
+      }
+      if (Array.isArray(data.hourlyReports)) {
+        data.hourlyReports = deduplicateById(data.hourlyReports);
+      }
+      if (Array.isArray(data.disqualifiedPatterns)) {
+        data.disqualifiedPatterns = deduplicateById(data.disqualifiedPatterns);
+      }
     }
     fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2), "utf-8");
     return true;

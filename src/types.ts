@@ -209,6 +209,8 @@ export interface DecisionLog {
   similarity?: SimilarityBreakdown;
   dataSource?: DataSource;
   marketRegime?: MarketRegime;
+  highProbabilitySetup?: boolean;
+  confluenceScore?: number;
   supportingCount: number;
   opposingCount: number;
   reasons: string[];
@@ -247,6 +249,8 @@ export interface Trade {
   supportingTimeframesCount: number;
   entryTime: number;
   expectedDurationMinutes: number;
+  highProbabilitySetup?: boolean;
+  confluenceScore?: number;
   
   // Execution & Tracking
   dataSource?: DataSource;

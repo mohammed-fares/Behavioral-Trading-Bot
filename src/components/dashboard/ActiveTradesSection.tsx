@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, Clock, Play } from 'lucide-react';
+import { Activity, Clock, Play, Sparkles } from 'lucide-react';
 import { Trade } from '../../types';
 
 interface ActiveTradesSectionProps {
@@ -78,6 +78,12 @@ export const ActiveTradesSection: React.FC<ActiveTradesSectionProps> = ({
                         <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-slate-300">
                           {trade.timeframe}
                         </span>
+                        {trade.highProbabilitySetup && (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-amber-400" />
+                            صفقة عالية النجاح
+                          </span>
+                        )}
                       </div>
                       <div className="text-xs text-slate-400 font-mono mt-0.5 flex items-center gap-1">
                         <span>النمط:</span>

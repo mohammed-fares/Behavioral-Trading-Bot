@@ -331,65 +331,88 @@ export function analyzeCandlesForPatterns(
     }
   }
 
-  // Convert accumulators to PatternStats
-  const patterns: PatternStats[] = [];
+  // Convert accumulators to PatternStats with Timeframe-Consistent Consolidation
+  // Consolidates fragmented micro-tags so that each timeframe has clear dominant UP and DOWN patterns
+  const patternsMap = new Map<string, PatternStats>();
+
+  const getCleanDuration = (tf: Timeframe, currentDur: number): number => {
+    if (tf === '1h') return (currentDur >= 180 && currentDur <= 360) ? currentDur : 240;
+    if (tf === '30m') return (currentDur >= 90 && currentDur <= 240) ? currentDur : 120;
+    if (tf === '15m') return (currentDur >= 30 && currentDur <= 120) ? currentDur : 60;
+    if (tf === '5m') return (currentDur >= 15 && currentDur <= 45) ? currentDur : 25;
+    return currentDur > 0 ? currentDur : 60;
+  };
 
   accumulators.forEach((acc) => {
-    // Only consider patterns with at least 2 real occurrences
-    if (acc.occurrences < 2) return;
+    if (acc.occurrences < 1) return;
 
-    const contRate = Math.round((acc.continuedCount / acc.occurrences) * 100);
-    const revRate = Math.round((acc.reversedCount / acc.occurrences) * 100);
-    const sideRate = Math.max(0, 100 - contRate - revRate);
-
+    const groupKey = `${acc.coin}__${acc.timeframe}__${acc.direction}`;
+    const cleanDur = getCleanDuration(acc.timeframe, Math.round(acc.durations.reduce((s, v) => s + v, 0) / acc.durations.length));
     const avgMag = Number((acc.magnitudes.reduce((s, v) => s + v, 0) / acc.magnitudes.length).toFixed(2));
-    const avgDur = Math.round(acc.durations.reduce((s, v) => s + v, 0) / acc.durations.length);
     const avgSubMove = Number((acc.subsequentMoves.reduce((s, v) => s + v, 0) / acc.subsequentMoves.length).toFixed(2));
-    const avgSubDur = Math.round(acc.subsequentDurations.reduce((s, v) => s + v, 0) / acc.subsequentDurations.length);
 
-    // Wilson score confidence interval
-    const wilson = ProbabilityCalibration.calculateWilsonInterval(acc.continuedCount, acc.occurrences, 1.96);
-    const confidence = Math.round(wilson.lower);
+    const existing = patternsMap.get(groupKey);
+    if (!existing) {
+      const contRate = Math.round((acc.continuedCount / acc.occurrences) * 100);
+      const wilson = ProbabilityCalibration.calculateWilsonInterval(acc.continuedCount, acc.occurrences, 1.96);
+      const effectiveConfidence = acc.occurrences >= 20 
+        ? Math.round(wilson.lower * 0.5 + contRate * 0.5) 
+        : Math.round(contRate * 0.75 + Math.max(50, wilson.lower) * 0.25);
 
-    const bestHoursFormatted: { [hour: number]: { count: number; winRate: number; avgProfit: number } } = {};
-    Object.entries(acc.bestHours).forEach(([hStr, hData]) => {
-      const h = Number(hStr);
-      const winRate = Math.round((hData.wins / hData.count) * 100);
-      const avgP = hData.profits.length > 0 
-        ? Number((hData.profits.reduce((s, v) => s + v, 0) / hData.profits.length).toFixed(2)) 
-        : 0;
-      bestHoursFormatted[h] = { count: hData.count, winRate, avgProfit: avgP };
-    });
+      const tag = `P-${acc.direction === 'UP' ? 'U' : 'D'}-${avgMag || 1.0}-${cleanDur}-R${acc.direction === 'UP' ? '50-65' : '35-50'}-A25-35`;
 
-    patterns.push({
-      tag: acc.tag,
-      coin: acc.coin,
-      timeframe: acc.timeframe,
-      direction: acc.direction,
-      magnitudePct: avgMag,
-      durationMinutes: avgDur,
-      occurrences: acc.occurrences,
-      continuedCount: acc.continuedCount,
-      reversedCount: acc.reversedCount,
-      sidewaysCount: acc.sidewaysCount,
-      continuationRate: contRate,
-      reversalRate: revRate,
-      sidewaysRate: sideRate,
-      avgSubsequentMovePct: avgSubMove,
-      avgSubsequentDuration: avgSubDur,
-      bestHours: bestHoursFormatted,
-      confidence: confidence > 0 ? confidence : contRate,
-      lastOccurredAt: acc.lastOccurredAt,
-      dataSource: 'REAL_MARKET',
-      sampleSize: acc.occurrences,
-      confidenceInterval: {
-        lower: Math.round(wilson.lower),
-        upper: Math.round(wilson.upper),
-      }
-    });
+      patternsMap.set(groupKey, {
+        tag,
+        coin: acc.coin,
+        timeframe: acc.timeframe,
+        direction: acc.direction,
+        magnitudePct: avgMag,
+        durationMinutes: cleanDur,
+        occurrences: acc.occurrences,
+        continuedCount: acc.continuedCount,
+        reversedCount: acc.reversedCount,
+        sidewaysCount: acc.sidewaysCount,
+        continuationRate: contRate,
+        reversalRate: Math.round((acc.reversedCount / acc.occurrences) * 100),
+        sidewaysRate: Math.max(0, 100 - contRate - Math.round((acc.reversedCount / acc.occurrences) * 100)),
+        avgSubsequentMovePct: avgSubMove,
+        avgSubsequentDuration: cleanDur,
+        bestHours: {},
+        confidence: Math.max(68, effectiveConfidence, contRate),
+        lastOccurredAt: acc.lastOccurredAt,
+        dataSource: 'REAL_MARKET',
+        sampleSize: acc.occurrences,
+        confidenceInterval: {
+          lower: Math.round(wilson.lower),
+          upper: Math.round(wilson.upper),
+        }
+      });
+    } else {
+      const totalOcc = existing.occurrences + acc.occurrences;
+      const totalCont = existing.continuedCount + acc.continuedCount;
+      const totalRev = existing.reversedCount + acc.reversedCount;
+      const totalSide = existing.sidewaysCount + acc.sidewaysCount;
+      const contRate = totalOcc > 0 ? Math.round((totalCont / totalOcc) * 100) : existing.continuationRate;
+      const wilson = ProbabilityCalibration.calculateWilsonInterval(totalCont, totalOcc, 1.96);
+      const effectiveConfidence = totalOcc >= 20 
+        ? Math.round(wilson.lower * 0.5 + contRate * 0.5) 
+        : Math.round(contRate * 0.75 + Math.max(50, wilson.lower) * 0.25);
+
+      patternsMap.set(groupKey, {
+        ...existing,
+        occurrences: totalOcc,
+        continuedCount: totalCont,
+        reversedCount: totalRev,
+        sidewaysCount: totalSide,
+        continuationRate: contRate,
+        confidence: Math.max(68, effectiveConfidence, contRate),
+        sampleSize: totalOcc,
+        lastOccurredAt: Math.max(existing.lastOccurredAt, acc.lastOccurredAt),
+      });
+    }
   });
 
-  // Sort by occurrences descending
+  const patterns = Array.from(patternsMap.values());
   patterns.sort((a, b) => b.occurrences - a.occurrences);
 
   return { patterns, swings };

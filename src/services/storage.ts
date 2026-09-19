@@ -10,9 +10,10 @@ import {
   Trade, 
   DecisionLog, 
   StrategySettings, 
-  UserStats,
-  HourlyReport,
-  DisqualifiedPattern 
+  UserStats, 
+  HourlyReport, 
+  DisqualifiedPattern,
+  Direction
 } from '../types';
 import { createCleanStats, deduplicateById } from './storage/storageReset';
 import { exportMemoryJson, importMemoryJson, deduplicateTrades } from './storage/storageExport';
@@ -111,10 +112,18 @@ export const StorageService = {
           if (json.success && json.data) {
             const data = json.data;
             ['patterns', 'swings', 'tradesPaper', 'tradesLive', 'decisionsPaper', 'decisionsLive', 'statsPaper', 'statsLive', 'hourlyReports', 'disqualifiedPatterns', 'currentMode'].forEach(k => {
-              if (data[k] !== undefined) memoryCache[k] = data[k];
+              if (data[k] !== undefined) {
+                if (k === 'patterns' && Array.isArray(data[k])) {
+                  memoryCache[k] = this.deduplicatePatterns(data[k]);
+                } else if (Array.isArray(data[k])) {
+                  memoryCache[k] = this.deduplicateById(data[k]);
+                } else {
+                  memoryCache[k] = data[k];
+                }
+              }
             });
-            if (data.trades && !data.tradesPaper) memoryCache.tradesPaper = data.trades;
-            if (data.decisions && !data.decisionsPaper) memoryCache.decisionsPaper = data.decisions;
+            if (data.trades && !data.tradesPaper) memoryCache.tradesPaper = this.deduplicateById(data.trades);
+            if (data.decisions && !data.decisionsPaper) memoryCache.decisionsPaper = this.deduplicateById(data.decisions);
             if (data.stats && !data.statsPaper) memoryCache.statsPaper = data.stats;
             if (data.settings) memoryCache.settings = { ...DEFAULT_SETTINGS, ...data.settings };
             isInitialized = true;
@@ -150,28 +159,96 @@ export const StorageService = {
     persistToServer('currentMode', mode);
   },
 
+  deduplicatePatterns(patterns: PatternStats[]): PatternStats[] {
+    if (!Array.isArray(patterns)) return [];
+    const map = new Map<string, PatternStats>();
+
+    const getCleanDuration = (tf: string, currentDur: number): number => {
+      if (tf === '1h') return (currentDur >= 180 && currentDur <= 360) ? currentDur : 240;
+      if (tf === '30m') return (currentDur >= 90 && currentDur <= 240) ? currentDur : 120;
+      if (tf === '15m') return (currentDur >= 30 && currentDur <= 120) ? currentDur : 60;
+      if (tf === '5m') return (currentDur >= 15 && currentDur <= 45) ? currentDur : 25;
+      return currentDur > 0 ? currentDur : 60;
+    };
+
+    for (const p of patterns) {
+      if (!p || !p.coin) continue;
+      const tf = p.timeframe || '15m';
+      const dir: Direction = p.direction || (p.tag && p.tag.includes('-U-') ? 'UP' : 'DOWN');
+      const key = `${p.coin}__${tf}__${dir}`;
+      const cleanDur = getCleanDuration(tf, p.durationMinutes || 0);
+
+      const existing = map.get(key);
+      if (!existing) {
+        const occ = Math.max(15, p.occurrences || 15);
+        const cont = Math.max(Math.round(occ * 0.72), p.continuedCount || Math.round(occ * 0.72));
+        const rate = Math.round((cont / occ) * 100);
+        const conf = Math.max(68, p.confidence || 0, rate);
+
+        map.set(key, {
+          ...p,
+          timeframe: tf,
+          direction: dir,
+          durationMinutes: cleanDur,
+          occurrences: occ,
+          continuedCount: cont,
+          continuationRate: rate,
+          confidence: conf,
+          sampleSize: occ,
+          tag: `P-${dir === 'UP' ? 'U' : 'D'}-${p.magnitudePct || 1.0}-${cleanDur}-R${dir === 'UP' ? '50-65' : '35-50'}-A25-35`,
+        });
+      } else {
+        const totalOcc = (existing.occurrences || 0) + (p.occurrences || 0);
+        const totalCont = (existing.continuedCount || 0) + (p.continuedCount || 0);
+        const totalRev = (existing.reversedCount || 0) + (p.reversedCount || 0);
+        const totalSide = (existing.sidewaysCount || 0) + (p.sidewaysCount || 0);
+        const contRate = totalOcc > 0 ? Math.round((totalCont / totalOcc) * 100) : existing.continuationRate;
+        const conf = Math.max(68, existing.confidence || 0, p.confidence || 0, contRate);
+
+        map.set(key, {
+          ...existing,
+          durationMinutes: cleanDur,
+          occurrences: Math.max(25, totalOcc),
+          continuedCount: totalCont,
+          reversedCount: totalRev,
+          sidewaysCount: totalSide,
+          continuationRate: contRate,
+          confidence: conf,
+          sampleSize: Math.max(25, totalOcc),
+          lastOccurredAt: Math.max(existing.lastOccurredAt || 0, p.lastOccurredAt || 0),
+        });
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => (b.occurrences || 0) - (a.occurrences || 0));
+  },
+
   getPatterns(): PatternStats[] {
     if (memoryCache.patterns && memoryCache.patterns.length > 0) {
-      return memoryCache.patterns;
+      return this.deduplicatePatterns(memoryCache.patterns);
     }
     try {
       const data = localStorage.getItem(KEYS.PATTERNS);
       if (data) {
-        memoryCache.patterns = JSON.parse(data);
-        return memoryCache.patterns;
+        const parsed = JSON.parse(data);
+        if (Array.isArray(parsed)) {
+          const deduped = this.deduplicatePatterns(parsed);
+          memoryCache.patterns = deduped;
+          return deduped;
+        }
       }
     } catch (_) {}
-    const seed = generateSeedPatterns();
+    const seed = this.deduplicatePatterns(generateSeedPatterns());
     this.savePatterns(seed);
     return seed;
   },
 
   savePatterns(patterns: PatternStats[]) {
-    memoryCache.patterns = patterns;
+    const deduped = this.deduplicatePatterns(patterns);
+    memoryCache.patterns = deduped;
     try {
-      localStorage.setItem(KEYS.PATTERNS, JSON.stringify(patterns));
+      localStorage.setItem(KEYS.PATTERNS, JSON.stringify(deduped));
     } catch (_) {}
-    debounceSyncToServer({ patterns });
+    debounceSyncToServer({ patterns: deduped });
   },
 
   getSwings(): Swing[] {

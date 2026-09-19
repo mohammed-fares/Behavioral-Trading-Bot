@@ -76,7 +76,19 @@ export const DecisionLogTab: React.FC<DecisionLogTabProps> = ({
     return Array.from(map.values());
   }, [decisions]);
 
-  const displayedList = showUniqueCoinsOnly ? uniqueCoinsList : decisions;
+  const displayedList = useMemo(() => {
+    const list = showUniqueCoinsOnly ? uniqueCoinsList : decisions;
+    const seen = new Set<string>();
+    const result: DecisionLog[] = [];
+    for (const d of list) {
+      if (!d || !d.id) continue;
+      if (!seen.has(d.id)) {
+        seen.add(d.id);
+        result.push(d);
+      }
+    }
+    return result;
+  }, [showUniqueCoinsOnly, uniqueCoinsList, decisions]);
 
   const filtered = useMemo(() => {
     return displayedList.filter(d => {
@@ -284,7 +296,7 @@ export const DecisionLogTab: React.FC<DecisionLogTabProps> = ({
             لا توجد قرارات مطابقة لمعايير الفلترة الحالية
           </div>
         ) : (
-          filtered.map((dec) => {
+          filtered.map((dec, idx) => {
             const isApproved = dec.status === 'APPROVED';
             const isRejected = dec.status === 'REJECTED';
             const isWait = dec.status === 'WAIT';
@@ -296,7 +308,7 @@ export const DecisionLogTab: React.FC<DecisionLogTabProps> = ({
 
             return (
               <div
-                key={dec.id}
+                key={`${dec.id || 'dec'}-${idx}`}
                 onClick={() => onViewDecision(dec)}
                 className="bg-slate-900/90 border border-slate-800 hover:border-slate-700 rounded-xl p-4 sm:p-5 shadow-sm transition cursor-pointer space-y-3"
               >
@@ -321,6 +333,12 @@ export const DecisionLogTab: React.FC<DecisionLogTabProps> = ({
                         <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 font-mono">
                           الإطار: {dec.baseTimeframe}
                         </span>
+                        {dec.highProbabilitySetup && (
+                          <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 flex items-center gap-1 font-sans">
+                            <Sparkles className="w-3 h-3 text-amber-400" />
+                            صفقة عالية النجاح (HPS {dec.confluenceScore || 78}%)
+                          </span>
+                        )}
                       </div>
                       <span className="text-[10px] text-slate-500 font-mono block mt-0.5">
                         {new Date(dec.timestamp).toLocaleTimeString()} UTC
